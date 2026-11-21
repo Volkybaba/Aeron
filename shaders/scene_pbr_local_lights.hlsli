@@ -34,7 +34,10 @@ struct SceneLocalLight {
                         * the user-facing falloff_radius_engine) */
 };
 
-StructuredBuffer<SceneLocalLight> local_lights : register(t1, space0);
+/* Local lights as a 2D RGBA32F texture (width = 2 float4s per light:
+ * texel (0, i) = (pos.xyz, range), texel (1, i) = (color.rgb,
+ * falloff_sq)), read with texelFetch — no vertex storage buffer (GLES). */
+Texture2D<float4> local_lights : register(t1, space0);
 
 /* Per-vertex coloured local-light accumulator. Returns
  * sum_i { contrib_i × lights[i].color } where contrib_i is the
@@ -49,7 +52,13 @@ float3 accumulate_local_lights(float3 rotated_local,
 {
     float3 local_rgb = float3(0.0f, 0.0f, 0.0f);
     for (uint li = 0; li < local_light_count; ++li) {
-        SceneLocalLight light = local_lights[local_light_base + li];
+        float4 light_tex0 = local_lights.Load(int3(0, local_light_base + li, 0));
+        float4 light_tex1 = local_lights.Load(int3(1, local_light_base + li, 0));
+        SceneLocalLight light;
+        light.pos        = light_tex0.xyz;
+        light.range      = light_tex0.w;
+        light.color      = light_tex1.rgb;
+        light.falloff_sq = light_tex1.w;
         float3 lp_local = mul(world_to_local,
                               light.pos - instance_world_pos);
         float3 d3 = lp_local - rotated_local;

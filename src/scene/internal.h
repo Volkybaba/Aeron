@@ -271,12 +271,19 @@ struct AeronScene3D {
 	uint32_t                   point_light_staging_cap;
 	AeronSceneClusterLightGPU* cluster_light_staging;
 	uint32_t                   cluster_light_staging_cap;
-	AeronBuffer*               mesh_table_buffer;
-	uint32_t                   mesh_table_buffer_cap;
-	AeronBuffer*               local_light_buffer;
-	uint32_t                   local_light_buffer_cap;
-	AeronBuffer*               point_light_buffer;
-	uint32_t                   point_light_buffer_cap;
+	/* Mesh-table + local-light lookup textures (RGBA32F, texelFetch).
+	 * Vertex stages on GLES allow zero storage blocks, so the lookup
+	 * tables ride textures instead of storage buffers. */
+	AeronTexture*              mesh_table_texture;
+	uint32_t                   mesh_table_texture_h;
+	AeronTexture*              local_light_texture;
+	uint32_t                   local_light_texture_h;
+	AeronSampler*              mesh_table_sampler;
+	/* Point-light lookup texture (RGBA32F, texelFetch): 2 texels per
+	 * light, height grows with the light count. Fragment stages on GLES
+	 * allow zero storage blocks, so the table rides a texture. */
+	AeronTexture*              point_light_texture;
+	uint32_t                   point_light_texture_h;
 	AeronBuffer*               cluster_light_buffer;
 	uint32_t                   cluster_light_buffer_cap;
 	int                        storage_ready;

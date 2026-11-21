@@ -6,9 +6,10 @@
  * cbuffer — the host issues `SDL_DrawGPUPrimitives(pass, 4, 1, 0, 0)`
  * with no input bindings beyond the FS-side textures/sampler/cbuffer.
  *
- * UV is flipped on Y (uv.y = 1 - cy) so NDC bottom maps to texture
- * bottom — matches the convention used by the blit shader and by
- * every RT this VS feeds. Paired with:
+ * UV is NOT flipped on Y (uv.y = cy): on GLES the flight RT holds
+ * its top at V=1, so NDC top must sample V=1. (v57: the old
+ * 1 - cy flip presented the flight upside-down on the shim; the
+ * 2D blit path is unaffected — it has its own UV handling.) Paired with:
  *   - flight_tonemap.frag (final present pass)
  *   - bloom_brightpass.frag / bloom_downsample.frag / bloom_upsample.frag
  */
@@ -26,6 +27,6 @@ VSOut main(uint vid : SV_VertexID)
 
     VSOut o;
     o.position = float4(cx * 2.0f - 1.0f, cy * 2.0f - 1.0f, 0.0f, 1.0f);
-    o.uv       = float2(cx, 1.0f - cy);
+    o.uv       = float2(cx, cy);
     return o;
 }

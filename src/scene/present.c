@@ -137,10 +137,13 @@ void AeronScenePresent_ApplySettings(const AeronSceneTonemapSettings* settings) 
 struct AeronScenePresentChain {
 	AeronTextureFormat     target_format;
 	AeronShader*           vs;
+	AeronShader*           vs_flip; /* v67: Y-flipped quad VS, flight present only */
 	AeronShader*           ps_sdr;
 	AeronShader*           ps_hdr;
 	AeronGraphicsPipeline* pipeline_sdr;
 	AeronGraphicsPipeline* pipeline_hdr;
+	AeronGraphicsPipeline* pipeline_sdr_flip;
+	AeronGraphicsPipeline* pipeline_hdr_flip;
 };
 
 static AeronGraphicsPipeline* present_pipeline(AeronShader* vs, AeronShader* ps, AeronTextureFormat fmt) {
@@ -170,6 +173,9 @@ AeronScenePresentChain* AeronScenePresentChain_Create(AeronTextureFormat target_
 	c->target_format = target_format;
 	c->vs =
 		AeronSceneInternal_CompileShader("scene_fullscreen_quad.vert", AERON_SHADER_STAGE_VERTEX, 0, 0, 0);
+	/* v67: flight-only flipped quad VS; missing file is non-fatal (flight falls back to the shared VS). */
+	c->vs_flip = AeronSceneInternal_CompileShader("scene_fullscreen_quad_flip.vert", AERON_SHADER_STAGE_VERTEX,
+												  0, 0, 0);
 	c->ps_sdr = AeronSceneInternal_CompileShader("scene_tonemap.frag", AERON_SHADER_STAGE_FRAGMENT, 2, 1, 0);
 	c->ps_hdr =
 		AeronSceneInternal_CompileShader("scene_tonemap_hdr.frag", AERON_SHADER_STAGE_FRAGMENT, 2, 1, 0);
@@ -178,6 +184,12 @@ AeronScenePresentChain* AeronScenePresentChain_Create(AeronTextureFormat target_
 	}
 	if (c->vs && c->ps_hdr) {
 		c->pipeline_hdr = present_pipeline(c->vs, c->ps_hdr, target_format);
+	}
+	if (c->vs_flip && c->ps_sdr) {
+		c->pipeline_sdr_flip = present_pipeline(c->vs_flip, c->ps_sdr, target_format);
+	}
+	if (c->vs_flip && c->ps_hdr) {
+		c->pipeline_hdr_flip = present_pipeline(c->vs_flip, c->ps_hdr, target_format);
 	}
 	if (!c->pipeline_sdr && !c->pipeline_hdr) {
 		AeronScenePresentChain_Destroy(c);
@@ -194,8 +206,14 @@ void AeronScenePresentChain_Destroy(AeronScenePresentChain* c) {
 		Aeron_DestroyGraphicsPipeline(c->pipeline_sdr);
 	if (c->pipeline_hdr)
 		Aeron_DestroyGraphicsPipeline(c->pipeline_hdr);
+	if (c->pipeline_sdr_flip)
+		Aeron_DestroyGraphicsPipeline(c->pipeline_sdr_flip);
+	if (c->pipeline_hdr_flip)
+		Aeron_DestroyGraphicsPipeline(c->pipeline_hdr_flip);
 	if (c->vs)
 		Aeron_DestroyShader(c->vs);
+	if (c->vs_flip)
+		Aeron_DestroyShader(c->vs_flip);
 	if (c->ps_sdr)
 		Aeron_DestroyShader(c->ps_sdr);
 	if (c->ps_hdr)
@@ -205,17 +223,30 @@ void AeronScenePresentChain_Destroy(AeronScenePresentChain* c) {
 
 void AeronScenePresentChain_Draw(AeronScenePresentChain* c, AeronRenderPass* pass, AeronTexture* scene_tex,
 								 AeronSampler* sampler, AeronTexture* bloom_tex, float bloom_intensity,
-								 int rt_w, int rt_h, float bar_y_uv, const float tint[4], int src_coverage) {
+								 int rt_w, int rt_h, float bar_y_uv, const float tint[4], int src_coverage,
+								 int flip_y) {
 	if (!c || !pass || !scene_tex || !sampler) {
 		return;
 	}
 	AeronGraphicsPipeline* pp = NULL;
-	if (Aeron_OutputHdrEnabled() && c->pipeline_hdr) {
-		pp = c->pipeline_hdr;
-	} else if (c->pipeline_sdr) {
-		pp = c->pipeline_sdr;
-	} else {
-		pp = c->pipeline_hdr;
+	/* v67: flip_y != 0 selects the Y-flipped quad pipelines (flight
+	 * present only); falls back to the shared pipelines when the
+	 * flipped variant is unavailable. */
+	if (flip_y) {
+		if (Aeron_OutputHdrEnabled() && c->pipeline_hdr_flip) {
+			pp = c->pipeline_hdr_flip;
+		} else if (c->pipeline_sdr_flip) {
+			pp = c->pipeline_sdr_flip;
+		}
+	}
+	if (!pp) {
+		if (Aeron_OutputHdrEnabled() && c->pipeline_hdr) {
+			pp = c->pipeline_hdr;
+		} else if (c->pipeline_sdr) {
+			pp = c->pipeline_sdr;
+		} else {
+			pp = c->pipeline_hdr;
+		}
 	}
 	if (!pp) {
 		return;
@@ -256,7 +287,13 @@ void AeronScenePresentChain_Draw(AeronScenePresentChain* c, AeronRenderPass* pas
 		(float)AeronScenePresent_AgxLook(),
 		AeronScenePresent_AgxPunchyPower(),
 		AeronScenePresent_AgxPunchySaturation(),
-		0.0f,
+		/* Linear 8-bit hedef (GLES/shim swapchain: RGBA8/BGRA8_UNORM) ->
+		 * tonemap cikisi sRGB-encode edilmeli; sRGB/float hedefte
+		 * hardware encode / linear ara hedef oldugu icin 0. */
+		(c && (c->target_format == AERON_TEXTURE_FORMAT_RGBA8_UNORM ||
+		       c->target_format == AERON_TEXTURE_FORMAT_BGRA8_UNORM))
+			? 1.0f
+			: 0.0f,
 	};
 	Aeron_BindUniformData(pass, AERON_SHADER_STAGE_FRAGMENT, 0, u, sizeof u);
 	Aeron_Draw(pass, 4, 0);

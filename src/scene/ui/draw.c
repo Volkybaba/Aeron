@@ -148,7 +148,7 @@ static AeronTextStyle ui_text_style(const AeronUiContext* ctx, const AeronFontAt
 	style.font        = font;
 	style.scale       = size_px / (float)font->cell_h;
 	style.tracking_px = ui_font_tracking_atlas(ctx, font) * style.scale;
-	style.filter      = AERON_BLIT2D_FILTER_LINEAR;
+	style.filter      = AERON_BLIT2D_FILTER_NEAREST;
 	style.tint[0]     = color[0];
 	style.tint[1]     = color[1];
 	style.tint[2]     = color[2];

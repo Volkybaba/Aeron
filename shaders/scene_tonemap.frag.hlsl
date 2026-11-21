@@ -178,9 +178,14 @@ float4 main(VSOut input) : SV_Target
 
     /* Perturb the encoded value by half an 8-bit code, then decode so the
      * hardware sRGB store reconstructs that value. One scalar noise sample
-     * avoids chroma speckle. */
+     * avoids chroma speckle.
+     * agx_params.w (host u[19]) = 1: linear 8-bit hedef (GLES/shim
+     * swapchain) -> sRGB-encode edilmis cikti dogrudan yazilir (hardware
+     * encode yok); 0: sRGB swapchain -> linear yazilir, hardware encode
+     * eder (eski davranis). */
     float dither = (ign_dither(input.position.xy) - 0.5f) * (1.0f / 255.0f);
-    rgb = AeronSrgbToLinear(saturate(AeronLinearToSrgb(saturate(rgb)) + dither));
+    float3 encoded = saturate(AeronLinearToSrgb(saturate(rgb)) + dither);
+    rgb = (agx_params.w > 0.5f) ? encoded : AeronSrgbToLinear(encoded);
 
     /* PMA-encode: rgb pre-multiplied by alpha so the hardware PMA-
      * over blend (src + dst*(1-src.a)) cross-fades the tonemapped

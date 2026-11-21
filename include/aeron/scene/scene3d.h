@@ -138,6 +138,11 @@ typedef struct AeronSceneMeshInstance {
 	 * geometry that never enters the depth prepass (XWA: soft-alpha
 	 * projectile ribbons) and would otherwise stay blur-sharp. */
 	uint8_t velocity_stamp;
+	/* Draw only the mesh's first-prim blend range in the transparent
+	 * pass (XWA: projectile bolts — the bolt OPT carries two crossed
+	 * quads; the first prim alone is a single streak). 0 = whole
+	 * blend range (default). */
+	uint8_t first_prim_only;
 	/* Ordinary mesh instances cast and receive directional shadows by
 	 * default. A receiver-local shadow map can preserve environment
 	 * shadows while excluding selected casters from selected receivers. */

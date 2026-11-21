@@ -283,6 +283,7 @@ int  Aeron_AudioInit(void);
 void Aeron_AudioShutdown(void);
 
 void Aeron_BeginInputFrame(AeronInputSnapshot* input);
+int  Aeron_MouseEventThisFrame(void);
 void Aeron_HandleEvent(const SDL_Event* event);
 void Aeron_ControllersInit(void);
 void Aeron_ControllersShutdown(void);

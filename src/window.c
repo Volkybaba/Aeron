@@ -65,6 +65,13 @@ int Aeron_WindowInit(const AeronConfig* config) {
 	g_aeron.window =
 		SDL_CreateWindow(title, width, height, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_VULKAN | SDL_WINDOW_FULLSCREEN);
 	if (!g_aeron.window) {
+		/* No Vulkan-capable window (e.g. SDL2-backend shim on GLES):
+		   the SDL GPU API does not need SDL_WINDOW_VULKAN, retry without it. */
+		Aeron_LogWarn("aeron", "SDL_CreateWindow with SDL_WINDOW_VULKAN failed: %s; retrying without it", SDL_GetError());
+		g_aeron.window =
+			SDL_CreateWindow(title, width, height, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_FULLSCREEN);
+	}
+	if (!g_aeron.window) {
 		Aeron_LogError("aeron", "SDL_CreateWindow failed: %s", SDL_GetError());
 		return 0;
 	}
@@ -133,6 +140,22 @@ int Aeron_GetWindowSize(int* width, int* height) {
 	int window_height = 0;
 
 	if (!g_aeron.window || !SDL_GetWindowSize(g_aeron.window, &window_width, &window_height)) {
+		return 0;
+	}
+	if (width) {
+		*width = window_width;
+	}
+	if (height) {
+		*height = window_height;
+	}
+	return window_width > 0 && window_height > 0;
+}
+
+int Aeron_GetWindowSizeInPixels(int* width, int* height) {
+	int window_width  = 0;
+	int window_height = 0;
+
+	if (!g_aeron.window || !SDL_GetWindowSizeInPixels(g_aeron.window, &window_width, &window_height)) {
 		return 0;
 	}
 	if (width) {

@@ -34,7 +34,10 @@ float2 AeronSharpBilinearTexcoord(float2 texcoord) {
 		return (texelBase + 0.5) / texSize;
 	}
 
-	return dstPixelsPerTexel.x > 1.0 && dstPixelsPerTexel.y > 1.0 ? (texelBase + sharpenedFract) / texSize
+	/* Non-uniform upscale (640x360 HD frame -> 640x480: x=1.0, y=1.333):
+	 * sharpen the upscaled axis too. Old && needed BOTH axes > 1.0, so
+	 * this stretch fell to plain bilinear and blurred text twice. */
+	return dstPixelsPerTexel.x > 1.0 || dstPixelsPerTexel.y > 1.0 ? (texelBase + sharpenedFract) / texSize
 																  : texcoord;
 }
 

@@ -1442,9 +1442,20 @@ static int Aeron_DrawTexture(SDL_GPUCommandBuffer* command_buffer, SDL_GPURender
 	} else if (color_space == AERON_COLOR_SPACE_LINEAR_DISPLAY) {
 		fragment_uniform[0] = 2.0f;
 	}
+	/* GLES/shim: swapchain dogrusal (linear) oldugunda, kaynak dogrusal
+	 * olarak gelir (blit, _SRGB dokuyu hardware-decode eder) ve ekranda
+	 * dogru gorunmesi icin linear->sRGB ENCODE gerekir (params.x=2,
+	 * w=1.0 -> saf LinearToSrgb). sRGB swapchain'de (Vulkan) donanim
+	 * geri kodlar; dogrusal swapchain'de encode shader'da yapilir.
+	 * v50'nin decode'u atlamasi yetmedi (degerler zaten dogrusaldi). */
+	if (!Aeron_IsSrgbSdlTextureFormat(target_format)) {
+		fragment_uniform[0] = 2.0f;
+		fragment_uniform[3] = 1.0f;
+	}
 	fragment_uniform[1]  = sharp_bilinear ? 1.0f : 0.0f;
 	fragment_uniform[2]  = output_rgb_scale > 0.0f ? output_rgb_scale : 1.0f;
-	fragment_uniform[3]  = decode_gamma > 0.0f ? decode_gamma : 0.0f;
+	fragment_uniform[3]  = (fragment_uniform[0] == 2.0f && !Aeron_IsSrgbSdlTextureFormat(target_format))
+					 ? 1.0f : (decode_gamma > 0.0f ? decode_gamma : 0.0f);
 	fragment_uniform[4]  = tint_rgba ? tint_rgba[0] : 1.0f;
 	fragment_uniform[5]  = tint_rgba ? tint_rgba[1] : 1.0f;
 	fragment_uniform[6]  = tint_rgba ? tint_rgba[2] : 1.0f;

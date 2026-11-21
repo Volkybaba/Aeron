@@ -26,5 +26,9 @@ float4 main(float4 pos : SV_Position,
 {
     float3 d = normalize(dir);
     float4 c = g_sky.Sample(g_sampler, d);
-    return float4(c.rgb * params.x, 1.0f);
+    float3 rgb = c.rgb * params.x;
+    // Volky: lift the very black space background a bit
+    // (device-confirmed v129); the bright nebula barely changes.
+    rgb += float3(0.03f, 0.03f, 0.05f);
+    return float4(rgb, 1.0f);
 }

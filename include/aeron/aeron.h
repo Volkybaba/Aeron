@@ -96,6 +96,11 @@ int Aeron_SetLogicalSize(int width, int height);
 int Aeron_GetLogicalSize(int* width, int* height);
 /* Returns the current window client size in logical points. */
 int Aeron_GetWindowSize(int* width, int* height);
+/* Returns the current window client size in physical pixels. Falls back to
+ * points when the pixel size is unavailable (identical to Aeron_GetWindowSize
+ * on 1:1 displays). Needed because points and pixels can disagree in aspect:
+ * on this device the window is 576x324 pt but 640x480 px. */
+int Aeron_GetWindowSizeInPixels(int* width, int* height);
 /* Constrains ordinary window resizing to one width:height ratio. Fixed-size
  * states such as fullscreen defer the constraint until they are left. */
 int Aeron_SetWindowAspectRatio(int aspect_width, int aspect_height);

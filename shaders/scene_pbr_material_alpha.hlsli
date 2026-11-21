@@ -37,9 +37,13 @@ struct GltfMaterial
     uint3  _pad;
 };
 
-StructuredBuffer<GltfMaterial> g_materials
+/* Fragment SSBOs as RGBA32F lookup textures (GLES: Mali exposes zero
+ * fragment storage blocks). Materials: 8 texels per record (7 float4
+ * fields + texel 7 carrying the uint flags as raw bits in .x, read back
+ * with asuint). Variants: 1 texel per uint4 group (raw bits, asuint). */
+Texture2D<float4> g_materials_tex
     : register(AERON_PBR_MATERIAL_REGISTER, space2);
-StructuredBuffer<uint4> g_prim_to_material
+Texture2D<float4> g_prim_to_material_tex
     : register(AERON_PBR_VARIANT_REGISTER, space2);
 Texture2D g_base_color
     : register(AERON_PBR_BASE_TEXTURE_REGISTER, space2);
@@ -52,7 +56,7 @@ uint pbr_resolve_material_index(uint prim_id, uint variant_row_base,
     uint slot = prim_id >> 2u;
     uint comp = prim_id & 3u;
     uint4 packed = slot < variant_group_count
-        ? g_prim_to_material[variant_row_base + slot]
+        ? asuint(g_prim_to_material_tex.Load(int3(0, variant_row_base + slot, 0)))
         : uint4(GLTF_NO_MATERIAL, GLTF_NO_MATERIAL,
                 GLTF_NO_MATERIAL, GLTF_NO_MATERIAL);
     return comp == 0u ? packed.x
@@ -76,6 +80,21 @@ GltfMaterial pbr_default_material()
     return material;
 }
 
+GltfMaterial pbr_load_material(uint material_index)
+{
+    GltfMaterial material;
+    material.base_rect = g_materials_tex.Load(int3(0, material_index, 0));
+    material.normal_rect = g_materials_tex.Load(int3(1, material_index, 0));
+    material.mr_rect = g_materials_tex.Load(int3(2, material_index, 0));
+    material.emissive_rect = g_materials_tex.Load(int3(3, material_index, 0));
+    material.base_color_factor = g_materials_tex.Load(int3(4, material_index, 0));
+    material.emissive_packed = g_materials_tex.Load(int3(5, material_index, 0));
+    material.metal_rough = g_materials_tex.Load(int3(6, material_index, 0));
+    material.flags = asuint(g_materials_tex.Load(int3(7, material_index, 0)).x);
+    material._pad = uint3(0, 0, 0);
+    return material;
+}
+
 GltfMaterial pbr_resolve_material(uint prim_id, uint variant_row_base,
                                   uint variant_group_count,
                                   uint material_count)
@@ -84,7 +103,7 @@ GltfMaterial pbr_resolve_material(uint prim_id, uint variant_row_base,
         prim_id, variant_row_base, variant_group_count);
     if (material_index != GLTF_NO_MATERIAL &&
         material_index < material_count) {
-        return g_materials[material_index];
+        return pbr_load_material(material_index);
     }
     return pbr_default_material();
 }

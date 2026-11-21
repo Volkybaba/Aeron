@@ -41,8 +41,8 @@ void AeronScene_MeshDestroy(AeronSceneMesh* m) {
 	if (m->ibo) {
 		Aeron_DestroyBuffer(m->ibo);
 	}
-	Aeron_DestroyBuffer(m->material_buffer);
-	Aeron_DestroyBuffer(m->variant_buffer);
+	Aeron_DestroyTexture(m->material_texture);
+	Aeron_DestroyTexture(m->variant_texture);
 	for (int c = 0; c < AERON_GLTF_CHANNEL_COUNT; c++) {
 		if (m->atlas[c]) {
 			Aeron_DestroyTexture(m->atlas[c]);
@@ -125,12 +125,16 @@ static int build_material_storage(AeronSceneMesh* s, const AeronGltfModel* model
 	}
 	s->material_count    = populate_material_entries(entries, model);
 	const uint32_t bytes = allocation_count * (uint32_t)sizeof *entries;
-	s->material_buffer   = Aeron_CreateBuffer(&(AeronBufferDesc) {
-		.size       = bytes,
-		.usage      = AERON_BUFFER_USAGE_STORAGE,
+	/* RGBA32F lookup texture: 8 texels per 128-byte material record. */
+	s->material_texture  = Aeron_CreateTexture(&(AeronTextureDesc) {
+		.width      = 8,
+		.height     = (int)allocation_count,
+		.mip_count  = 1,
+		.format     = AERON_TEXTURE_FORMAT_RGBA32_FLOAT,
+		.usage      = AERON_TEXTURE_USAGE_SAMPLED | AERON_TEXTURE_USAGE_TRANSFER_DST,
 		.debug_name = name,
 	});
-	if (!s->material_buffer) {
+	if (!s->material_texture) {
 		free(entries);
 		return 0;
 	}
@@ -172,12 +176,16 @@ static int build_variant_storage(AeronSceneMesh* s, const AeronGltfModel* model,
 		}
 	}
 	const uint32_t bytes = (uint32_t)(value_count * sizeof *values);
-	s->variant_buffer    = Aeron_CreateBuffer(&(AeronBufferDesc) {
-		.size       = bytes,
-		.usage      = AERON_BUFFER_USAGE_STORAGE,
+	/* RGBA32F lookup texture: 1 texel per uint4 group (groups * rows). */
+	s->variant_texture   = Aeron_CreateTexture(&(AeronTextureDesc) {
+		.width      = 1,
+		.height     = (int)(groups * rows),
+		.mip_count  = 1,
+		.format     = AERON_TEXTURE_FORMAT_RGBA32_FLOAT,
+		.usage      = AERON_TEXTURE_USAGE_SAMPLED | AERON_TEXTURE_USAGE_TRANSFER_DST,
 		.debug_name = name,
 	});
-	if (!s->variant_buffer) {
+	if (!s->variant_texture) {
 		free(values);
 		return 0;
 	}
@@ -286,6 +294,45 @@ AeronSceneMesh* AeronScene_MeshCreate(AeronCommandBuffer* cmd, const AeronFlight
 		s->mask_index_count   = model->mask_index_count;
 		s->blend_index_offset = model->blend_index_offset;
 		s->blend_index_count  = model->blend_index_count;
+		/* First-prim blend range: the index partition is stable, so
+		 * the first prim's blend triangles lead the blend range.
+		 * Scan for the first prim_id change to find its extent. */
+		s->first_prim_blend_count = 0;
+		if (model->blend_index_count > 0 && model->vertices && model->indices) {
+			const uint32_t first_pid =
+				model->vertices[model->indices[model->blend_index_offset]].prim_id;
+			uint32_t n = 0;
+			for (uint32_t t = 0; t + 2 < model->blend_index_count; t += 3) {
+				const uint32_t pid =
+					model->vertices[model->indices[model->blend_index_offset + t]].prim_id;
+				if (pid != first_pid)
+					break;
+				n += 3;
+			}
+			s->first_prim_blend_count = n;
+		}
+		/* DIAG8: log the first-prim blend range per mesh (load time).
+		 * TEMPORARY: remove before any 1.1.2 release. */
+		if (model->blend_index_count > 0) {
+			Aeron_LogInfo("xwa.diag", "DIAG8 mesh=%s opaque=%u blend=%u first_prim_blend=%u",
+				      name, model->opaque_index_count, model->blend_index_count,
+				      s->first_prim_blend_count);
+		}
+		/* DIAG9: dump blend triangles (pos + prim_id) for laser meshes.
+		 * TEMPORARY: remove before any 1.1.2 release. */
+		if (model->blend_index_count > 0 && name && strstr(name, "laser") != NULL) {
+			for (uint32_t t = 0; t + 2 < model->blend_index_count; t += 3) {
+				const AeronGltfVertex* v0 = &model->vertices[model->indices[model->blend_index_offset + t + 0]];
+				const AeronGltfVertex* v1 = &model->vertices[model->indices[model->blend_index_offset + t + 1]];
+				const AeronGltfVertex* v2 = &model->vertices[model->indices[model->blend_index_offset + t + 2]];
+				Aeron_LogInfo("xwa.diag",
+					      "DIAG9 %s tri=%u pid=%u (%.2f,%.2f,%.2f) (%.2f,%.2f,%.2f) (%.2f,%.2f,%.2f)",
+					      name, t / 3, v0->prim_id,
+					      v0->pos[0], v0->pos[1], v0->pos[2],
+					      v1->pos[0], v1->pos[1], v1->pos[2],
+					      v2->pos[0], v2->pos[1], v2->pos[2]);
+			}
+		}
 
 		s->cpu_vertices =
 			(AeronSceneMeshCpuVertex*)malloc((size_t)model->vertex_count * sizeof *s->cpu_vertices);
@@ -372,17 +419,37 @@ AeronSceneMesh* AeronScene_MeshCreate(AeronCommandBuffer* cmd, const AeronFlight
 		buffer_uploads[buffer_upload_count++] =
 			(AeronBufferUploadDesc) { .buffer = s->ibo, .data = model->indices, .size = ibo_bytes };
 	}
-	buffer_uploads[buffer_upload_count++] = (AeronBufferUploadDesc) { .buffer = s->material_buffer,
-																	  .data   = material_entries,
-																	  .size   = material_bytes };
-	buffer_uploads[buffer_upload_count++] = (AeronBufferUploadDesc) { .buffer = s->variant_buffer,
-																	  .data   = variant_values,
-																	  .size   = variant_bytes };
 	const int buffers_uploaded = Aeron_UploadBufferBatchCmd(cmd, buffer_uploads, buffer_upload_count);
+	if (!buffers_uploaded) {
+		Aeron_LogError("aeron.scene", "%s: geometry batch upload failed", name);
+		free(material_entries);
+		free(variant_values);
+		AeronScene_MeshDestroy(s);
+		return NULL;
+	}
+	/* Material/variant tables upload as raw RGBA32F texels (bit-preserving
+	 * for the uint flags / variant indices, read back with asuint). */
+	AeronTextureUploadDesc texture_uploads[2] = {
+		{ .texture  = s->material_texture,
+		  .mip_level = 0, .x = 0, .y = 0,
+		  .width     = 8,
+		  .height    = (int)(material_bytes / sizeof(AeronPbrMaterialEntry)),
+		  .raw_data  = material_entries,
+		  .raw_size  = material_bytes,
+		  .cycle     = 1 },
+		{ .texture  = s->variant_texture,
+		  .mip_level = 0, .x = 0, .y = 0,
+		  .width     = 1,
+		  .height    = (int)(variant_bytes / 16u),
+		  .raw_data  = variant_values,
+		  .raw_size  = variant_bytes,
+		  .cycle     = 1 },
+	};
+	const int textures_uploaded = Aeron_UploadTextureBatchCmd(cmd, texture_uploads, 2);
 	free(material_entries);
 	free(variant_values);
-	if (!buffers_uploaded) {
-		Aeron_LogError("aeron.scene", "%s: geometry/material batch upload failed", name);
+	if (!textures_uploaded) {
+		Aeron_LogError("aeron.scene", "%s: material batch upload failed", name);
 		AeronScene_MeshDestroy(s);
 		return NULL;
 	}

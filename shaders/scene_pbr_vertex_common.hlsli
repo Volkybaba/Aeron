@@ -37,16 +37,19 @@ cbuffer GltfMeshVSUniforms : register(b0, space1) {
 };
 
 /* One AERON_MESH_TABLE_STRIDE_VEC4-float4 record per unique submitted
- * mesh table; layout shared with AeronSceneMeshTable. */
+ * mesh table; layout shared with AeronSceneMeshTable. The table is a
+ * 2D RGBA32F texture (width = stride, height = table count) read with
+ * texelFetch: vertex stages on GLES allow zero storage blocks, so the
+ * lookup table rides a texture instead of a storage buffer. */
 #include "mesh_table_layout.hlsli"
-StructuredBuffer<float4> mesh_tables : register(t0, space0);
+Texture2D<float4> mesh_tables : register(t0, space0);
 static const uint MESH_TABLE_STRIDE = AERON_MESH_TABLE_STRIDE_VEC4;
 static const uint MESH_VISIBILITY_OFFSET = AERON_MESH_VISIBILITY_OFFSET;
 static const uint MESH_EMISSIVE_OFFSET = AERON_MESH_EMISSIVE_OFFSET;
 
 float4 mesh_table_load(uint table_index, uint offset)
 {
-	return mesh_tables[table_index * MESH_TABLE_STRIDE + offset];
+	return mesh_tables.Load(int3(offset, table_index, 0));
 }
 
 struct VSIn {

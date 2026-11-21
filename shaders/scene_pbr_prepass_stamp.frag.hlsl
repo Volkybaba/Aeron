@@ -14,16 +14,19 @@
  * previous transforms. The normal RT rides along write-masked (2-RT
  * velocity-prepass layout); only SV_Target1 lands.
  *
- * t0/s0 is the base-color atlas. Material and variant-map storage follow
- * it at t1 and t2.
+ * t0/s0 is the base-color atlas. Material and variant-map lookup
+ * textures ride at t8 and t9 (unified with the mesh pipeline).
  */
 
 #include "scene_pbr_atlas_sample.hlsli"
 #include "scene_pbr_prepass_common.hlsli"
 #include "scene_pbr_vsout.hlsli"
 
-#define AERON_PBR_MATERIAL_REGISTER t1
-#define AERON_PBR_VARIANT_REGISTER t2
+/* Unified with the mesh pipeline (t8/t9): the C side binds the
+ * material/variant lookup textures at sampler slots 8/9 for every PBR
+ * fragment shader, so the registers must match across pipelines. */
+#define AERON_PBR_MATERIAL_REGISTER t8
+#define AERON_PBR_VARIANT_REGISTER t9
 #include "scene_pbr_material_alpha.hlsli"
 
 /* Texels below this alpha are not visible enough to deserve motion

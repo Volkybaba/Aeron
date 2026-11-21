@@ -61,6 +61,13 @@ typedef struct AeronSceneMesh {
 	uint32_t                 mask_index_count;
 	uint32_t                 blend_index_offset;
 	uint32_t                 blend_index_count;
+	/* Blend index count of the FIRST primitive in the blend range
+	 * (the partition is stable, so the first prim's triangles lead).
+	 * 0 = whole blend range (single-prim mesh or not computed).
+	 * Used by per-instance first-prim-only draws (XWA: projectile
+	 * ribbons — the bolt OPT carries two crossed quads; drawing only
+	 * the first leaves a single streak). */
+	uint32_t                 first_prim_blend_count;
 	AeronSceneMeshCpuVertex* cpu_vertices;
 	uint16_t*                cpu_indices;
 
@@ -68,8 +75,12 @@ typedef struct AeronSceneMesh {
 	 * Factor-only models have no atlases; textured models carry all four. */
 	AeronTexture* atlas[AERON_GLTF_CHANNEL_COUNT];
 
-	AeronBuffer* material_buffer;
-	AeronBuffer* variant_buffer;
+	/* Material/variant lookup textures (RGBA32F, texelFetch): materials
+	 * 8 texels per record, variants 1 texel per uint4 group. Fragment
+	 * stages on GLES allow zero storage blocks, so the tables ride
+	 * textures. */
+	AeronTexture* material_texture;
+	AeronTexture* variant_texture;
 	uint32_t     material_count;
 	uint32_t     total_prim_count;
 	uint32_t     variant_slots;

@@ -86,7 +86,7 @@ int CaptureBloom_Record(CaptureBloom* b, const CaptureConfig* c, AeronRenderTarg
 	if (!pass)
 		return 0;
 	AeronScenePresentChain_Draw(b->present, pass, scene, b->sampler, bloom, c->bloom_intensity, c->width,
-								c->height, 1, NULL, 0);
+								c->height, 1, NULL, 0, 0);
 	Aeron_EndRenderPass(pass);
 	return 1;
 }

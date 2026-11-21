@@ -139,7 +139,7 @@ static int ensure_overlay_resources(AeronScene3D* scene) {
 	}
 	scene->overlay_tried = 1;
 	scene->overlay_vs =
-		AeronSceneInternal_CompileShader("scene_mesh_overlay.vert", AERON_SHADER_STAGE_VERTEX, 0, 1, 1);
+		AeronSceneInternal_CompileShader("scene_mesh_overlay.vert", AERON_SHADER_STAGE_VERTEX, 1, 1, 0);
 	scene->overlay_fs =
 		AeronSceneInternal_CompileShader("scene_mesh_overlay.frag", AERON_SHADER_STAGE_FRAGMENT, 1, 1, 0);
 	if (!scene->overlay_vs || !scene->overlay_fs) {
@@ -187,7 +187,8 @@ void AeronSceneMeshOverlay_Draw(AeronScene3D* scene, AeronRenderPass* render_pas
 		return;
 	}
 	Aeron_BindVertexBuffer(render_pass, 0, scene->overlay_vb, 0);
-	Aeron_BindStorageBuffer(render_pass, AERON_SHADER_STAGE_VERTEX, 0, scene->mesh_table_buffer);
+	Aeron_BindTextureSampler(render_pass, AERON_SHADER_STAGE_VERTEX, 0, scene->mesh_table_texture,
+							 scene->mesh_table_sampler);
 	for (uint32_t overlay_index = 0; overlay_index < scene->overlay_count; overlay_index++) {
 		const AeronSceneMeshOverlayEntry* overlay  = &scene->overlays[overlay_index];
 		AeronGraphicsPipeline*            pipeline = scene->overlay_pipes[overlay->blend][overlay->cull_mode];

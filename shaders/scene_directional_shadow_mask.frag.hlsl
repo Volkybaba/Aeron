@@ -2,8 +2,11 @@
 
 #include "scene_pbr_atlas_sample.hlsli"
 
-#define AERON_PBR_MATERIAL_REGISTER t1
-#define AERON_PBR_VARIANT_REGISTER t2
+/* Unified with the mesh pipeline (t8/t9): the C side binds the
+ * material/variant lookup textures at sampler slots 8/9 for every PBR
+ * fragment shader, so the registers must match across pipelines. */
+#define AERON_PBR_MATERIAL_REGISTER t8
+#define AERON_PBR_VARIANT_REGISTER t9
 #include "scene_pbr_material_alpha.hlsli"
 
 struct FSIn

@@ -61,7 +61,7 @@ static int blit2d_ensure(void) {
 		.stage                = AERON_SHADER_STAGE_VERTEX,
 		.sampler_count        = 0,
 		.uniform_buffer_count = 1,
-		.storage_buffer_count = 1,
+		.storage_buffer_count = 0,
 	});
 	G.fs  = Aeron_CreateShader(&(AeronShaderDesc) {
 		.name                 = "scene_blit.frag",
@@ -118,7 +118,7 @@ static int blit2d_rr_ensure(void) {
 		.stage                = AERON_SHADER_STAGE_VERTEX,
 		.sampler_count        = 0,
 		.uniform_buffer_count = 1,
-		.storage_buffer_count = 1,
+		.storage_buffer_count = 0,
 	});
 	G.fs_rr = Aeron_CreateShader(&(AeronShaderDesc) {
 		.name                 = "scene_ui_rect.frag",
@@ -190,10 +190,109 @@ static AeronBlendStateDesc blit_blend_state(AeronBlit2DBlend blend) {
 	return bs;
 }
 
+typedef struct Blit2DInstance {
+	float dst_x, dst_y, dst_w, dst_h;
+	float src_u0, src_v0, src_u1, src_v1;
+	float tint_r, tint_g, tint_b, tint_a;
+	float bias_r, bias_g, bias_b, bias_a;
+	float trap_top_dx_left, trap_top_dx_right, trap_top_w, _trap_pad;
+} Blit2DInstance;
+
+/* One expanded vertex: the sprite payload plus its list corner.
+ * Prepare() emits six of these per DL2D_SPRITE record (corners
+ * (0,0),(1,0),(0,1) + (1,0),(1,1),(0,1) — two triangles), so the
+ * draw is a plain per-vertex TRIANGLELIST — no instancing, no
+ * SV_VertexID. A strip would not restart between quads: the two
+ * bridging triangles at every quad boundary overdraw the glyphs
+ * with the next sprite's UVs (horizontal ghost). */
+typedef struct Blit2DVertex {
+	Blit2DInstance quad;
+	float corner_x, corner_y;
+} Blit2DVertex;
+
+typedef struct Blit2DQuad4Uniform {
+	float corners[4][4];
+	float q[4];
+	float ndc_depth[4];
+	float tint_r, tint_g, tint_b, tint_a;
+	float bias_r, bias_g, bias_b, bias_a;
+} Blit2DQuad4Uniform;
+
+typedef struct Blit2DRunUniform {
+	float    ndc_scale[2];
+	float    output_rgb_scale;
+	uint32_t _pad; /* reserved; instance offset is the bound vertex-buffer offset */
+} Blit2DRunUniform;
+
+/* Attribute layout MUST match the vertex shader inputs in
+ * scene_blit.vert.hlsl / scene_ui_rect.vert.hlsl. */
+typedef struct Blit2DRRectInstance {
+	float dst_x, dst_y, dst_w, dst_h;
+	float radius, border, bevel, soft;
+	float fill_top[4];
+	float fill_bottom[4];
+	float border_col[4];
+	float bevel_hi[4];
+	float bevel_lo[4];
+} Blit2DRRectInstance;
+
+typedef char Blit2DInstanceSizeCheck[sizeof(Blit2DInstance) == 80 ? 1 : -1];
+typedef char Blit2DVertexSizeCheck[sizeof(Blit2DVertex) == 88 ? 1 : -1];
+typedef char Blit2DQuad4UniformSizeCheck[sizeof(Blit2DQuad4Uniform) == 128 ? 1 : -1];
+typedef char Blit2DRunUniformSizeCheck[sizeof(Blit2DRunUniform) == 16 ? 1 : -1];
+typedef char Blit2DRRectInstanceSizeCheck[sizeof(Blit2DRRectInstance) == 112 ? 1 : -1];
+
+/* Per-vertex attributes for the sprite blit pipeline:
+ * one float4 per Blit2DVertex.quad field, locations 0..4, plus the
+ * strip corner float2 at location 5. */
+static const AeronVertexBufferLayoutDesc blit_instance_buffer_layout = {
+	.slot = 0, .stride = (uint32_t)sizeof(Blit2DVertex), .per_instance = 0,
+};
+static const AeronVertexAttributeDesc blit_instance_attributes[6] = {
+	{ .location = 0, .buffer_slot = 0, .format = AERON_VERTEX_FORMAT_FLOAT4,
+	  .offset = (uint32_t)(offsetof(Blit2DVertex, quad) + offsetof(Blit2DInstance, dst_x)) },
+	{ .location = 1, .buffer_slot = 0, .format = AERON_VERTEX_FORMAT_FLOAT4,
+	  .offset = (uint32_t)(offsetof(Blit2DVertex, quad) + offsetof(Blit2DInstance, src_u0)) },
+	{ .location = 2, .buffer_slot = 0, .format = AERON_VERTEX_FORMAT_FLOAT4,
+	  .offset = (uint32_t)(offsetof(Blit2DVertex, quad) + offsetof(Blit2DInstance, tint_r)) },
+	{ .location = 3, .buffer_slot = 0, .format = AERON_VERTEX_FORMAT_FLOAT4,
+	  .offset = (uint32_t)(offsetof(Blit2DVertex, quad) + offsetof(Blit2DInstance, bias_r)) },
+	{ .location = 4, .buffer_slot = 0, .format = AERON_VERTEX_FORMAT_FLOAT4,
+	  .offset = (uint32_t)(offsetof(Blit2DVertex, quad) + offsetof(Blit2DInstance, trap_top_dx_left)) },
+	{ .location = 5, .buffer_slot = 0, .format = AERON_VERTEX_FORMAT_FLOAT2,
+	  .offset = (uint32_t)offsetof(Blit2DVertex, corner_x) },
+};
+
+/* Per-instance vertex attributes for the rounded-rect pipeline:
+ * one float4 per Blit2DRRectInstance field, locations 0..6. */
+static const AeronVertexBufferLayoutDesc rr_instance_buffer_layout = {
+	.slot = 0, .stride = (uint32_t)sizeof(Blit2DRRectInstance), .per_instance = 1,
+};
+static const AeronVertexAttributeDesc rr_instance_attributes[7] = {
+	{ .location = 0, .buffer_slot = 0, .format = AERON_VERTEX_FORMAT_FLOAT4,
+	  .offset = (uint32_t)offsetof(Blit2DRRectInstance, dst_x) },
+	{ .location = 1, .buffer_slot = 0, .format = AERON_VERTEX_FORMAT_FLOAT4,
+	  .offset = (uint32_t)offsetof(Blit2DRRectInstance, radius) },
+	{ .location = 2, .buffer_slot = 0, .format = AERON_VERTEX_FORMAT_FLOAT4,
+	  .offset = (uint32_t)offsetof(Blit2DRRectInstance, fill_top) },
+	{ .location = 3, .buffer_slot = 0, .format = AERON_VERTEX_FORMAT_FLOAT4,
+	  .offset = (uint32_t)offsetof(Blit2DRRectInstance, fill_bottom) },
+	{ .location = 4, .buffer_slot = 0, .format = AERON_VERTEX_FORMAT_FLOAT4,
+	  .offset = (uint32_t)offsetof(Blit2DRRectInstance, border_col) },
+	{ .location = 5, .buffer_slot = 0, .format = AERON_VERTEX_FORMAT_FLOAT4,
+	  .offset = (uint32_t)offsetof(Blit2DRRectInstance, bevel_hi) },
+	{ .location = 6, .buffer_slot = 0, .format = AERON_VERTEX_FORMAT_FLOAT4,
+	  .offset = (uint32_t)offsetof(Blit2DRRectInstance, bevel_lo) },
+};
+
 static AeronGraphicsPipeline* cache_lookup(Blit2DPipelineEntry* entries, int* count, AeronShader* vs,
 										   AeronShader* fs, AeronTextureFormat color_format,
 										   AeronBlit2DBlend blend, AeronTextureFormat depth_format,
-										   AeronSampleCount sample_count, int depth_test, const char* what) {
+										   AeronSampleCount sample_count, int depth_test, const char* what,
+					   const AeronVertexBufferLayoutDesc* vertex_buffers,
+					   uint32_t vertex_buffer_count,
+					   const AeronVertexAttributeDesc* attributes,
+					   uint32_t attribute_count) {
 	for (int i = 0; i < *count; i++) {
 		Blit2DPipelineEntry* e = &entries[i];
 		if (e->format == color_format && e->blend == blend && e->depth_format == depth_format &&
@@ -211,8 +310,12 @@ static AeronGraphicsPipeline* cache_lookup(Blit2DPipelineEntry* entries, int* co
 	AeronGraphicsPipeline* p = Aeron_CreateGraphicsPipeline(&(AeronGraphicsPipelineDesc) {
 		.vertex_shader   = vs,
 		.fragment_shader = fs,
-		.primitive_type  = AERON_PRIMITIVE_TRIANGLE_STRIP,
+		.primitive_type  = AERON_PRIMITIVE_TRIANGLES,
 		.cull_mode       = AERON_CULL_NONE,
+		.vertex_buffers  = vertex_buffers,
+		.vertex_buffer_count = vertex_buffer_count,
+		.attributes      = attributes,
+		.attribute_count = attribute_count,
 		.color_format    = color_format,
 		.depth_format    = depth_format,
 		.depth           = depth_test ? (AeronDepthStateDesc) { .depth_test  = 1,
@@ -245,7 +348,8 @@ static AeronGraphicsPipeline* blit2d_pipeline(AeronTextureFormat color_format, A
 		return NULL;
 	}
 	return cache_lookup(G.pipelines, &G.pipeline_count, G.vs, G.fs, color_format, blend, depth_format,
-						sample_count, 0, "blit pipeline");
+						sample_count, 0, "blit pipeline", &blit_instance_buffer_layout, 1,
+						blit_instance_attributes, 6);
 }
 
 static AeronGraphicsPipeline* blit2d_pipeline4(AeronTextureFormat color_format, AeronBlit2DBlend blend,
@@ -255,7 +359,7 @@ static AeronGraphicsPipeline* blit2d_pipeline4(AeronTextureFormat color_format, 
 		return NULL;
 	}
 	return cache_lookup(G.pipelines4, &G.pipeline4_count, G.vs4, G.fs, color_format, blend, depth_format,
-						sample_count, depth_test, "blit4 pipeline");
+						sample_count, depth_test, "blit4 pipeline", NULL, 0, NULL, 0);
 }
 
 /* Rounded rects always blend PMA and never depth-test. */
@@ -266,46 +370,10 @@ static AeronGraphicsPipeline* blit2d_pipeline_rr(AeronTextureFormat color_format
 		return NULL;
 	}
 	return cache_lookup(G.pipelines_rr, &G.pipeline_rr_count, G.vs_rr, G.fs_rr, color_format,
-						AERON_BLIT2D_BLEND_PMA, depth_format, sample_count, 0, "rrect pipeline");
+						AERON_BLIT2D_BLEND_PMA, depth_format, sample_count, 0, "rrect pipeline",
+						&rr_instance_buffer_layout, 1, rr_instance_attributes, 7);
 }
 
-typedef struct Blit2DInstance {
-	float dst_x, dst_y, dst_w, dst_h;
-	float src_u0, src_v0, src_u1, src_v1;
-	float tint_r, tint_g, tint_b, tint_a;
-	float bias_r, bias_g, bias_b, bias_a;
-	float trap_top_dx_left, trap_top_dx_right, trap_top_w, _trap_pad;
-} Blit2DInstance;
-
-typedef struct Blit2DQuad4Uniform {
-	float corners[4][4];
-	float q[4];
-	float ndc_depth[4];
-	float tint_r, tint_g, tint_b, tint_a;
-	float bias_r, bias_g, bias_b, bias_a;
-} Blit2DQuad4Uniform;
-
-typedef struct Blit2DRunUniform {
-	float    ndc_scale[2];
-	float    output_rgb_scale;
-	uint32_t base_instance;
-} Blit2DRunUniform;
-
-/* Storage layout MUST match RRectInstance in scene_ui_rect.vert.hlsl. */
-typedef struct Blit2DRRectInstance {
-	float dst_x, dst_y, dst_w, dst_h;
-	float radius, border, bevel, soft;
-	float fill_top[4];
-	float fill_bottom[4];
-	float border_col[4];
-	float bevel_hi[4];
-	float bevel_lo[4];
-} Blit2DRRectInstance;
-
-typedef char Blit2DInstanceSizeCheck[sizeof(Blit2DInstance) == 80 ? 1 : -1];
-typedef char Blit2DQuad4UniformSizeCheck[sizeof(Blit2DQuad4Uniform) == 128 ? 1 : -1];
-typedef char Blit2DRunUniformSizeCheck[sizeof(Blit2DRunUniform) == 16 ? 1 : -1];
-typedef char Blit2DRRectInstanceSizeCheck[sizeof(Blit2DRRectInstance) == 112 ? 1 : -1];
 
 static void blit2d_draw_quad4(AeronRenderPass* pass, AeronGraphicsPipeline* pipe, AeronTexture* tex,
 							  AeronSampler* sampler, const Blit2DQuad4Uniform* u) {
@@ -352,7 +420,7 @@ typedef struct Dl2dRecord {
 
 struct AeronDrawList2D {
 	Dl2dRecord*     records;
-	Blit2DInstance* instances;
+	Blit2DVertex*   instances; /* 4 vertices per DL2D_SPRITE record */
 	AeronBuffer*    instance_buffer;
 	uint32_t        instance_buffer_capacity;
 	uint32_t        instance_count;
@@ -381,7 +449,7 @@ AeronDrawList2D* AeronDrawList_Create(int record_cap) {
 	}
 	l->cap       = record_cap > 0 ? record_cap : AERON_DRAWLIST2D_DEFAULT_CAP;
 	l->records   = (Dl2dRecord*)calloc((size_t)l->cap, sizeof *l->records);
-	l->instances = (Blit2DInstance*)calloc((size_t)l->cap, sizeof *l->instances);
+	l->instances = (Blit2DVertex*)calloc((size_t)l->cap * 6u, sizeof *l->instances);
 	if (!l->records || !l->instances) {
 		free(l->instances);
 		free(l->records);
@@ -671,7 +739,7 @@ void AeronDrawList_AddFrame(AeronDrawList2D* l, float x, float y, float w, float
 }
 
 /* Grows (never shrinks) one storage buffer and uploads `required` bytes. */
-static int dl2d_upload_storage(AeronDrawList2D* l, AeronCommandBuffer* cmd, AeronBuffer** buffer,
+static int dl2d_upload_instances(AeronDrawList2D* l, AeronCommandBuffer* cmd, AeronBuffer** buffer,
 							   uint32_t* buffer_capacity, const void* data, uint32_t required,
 							   const char* debug_name) {
 	if (!*buffer || *buffer_capacity < required) {
@@ -685,17 +753,17 @@ static int dl2d_upload_storage(AeronDrawList2D* l, AeronCommandBuffer* cmd, Aero
 		}
 		AeronBuffer* replacement = Aeron_CreateBuffer(&(AeronBufferDesc) {
 			.size         = capacity,
-			.usage        = AERON_BUFFER_USAGE_STORAGE,
+			.usage        = AERON_BUFFER_USAGE_VERTEX,
 			.memory_usage = AERON_MEMORY_USAGE_DYNAMIC,
 			.debug_name   = debug_name,
 		});
 		if (!replacement) {
 			if (!l->storage_error_logged) {
-				Aeron_LogError("aeron.scene", "drawlist2d storage allocation failed (%u bytes): %s", capacity,
+				Aeron_LogError("aeron.scene", "drawlist2d instance allocation failed (%u bytes): %s", capacity,
 							   SDL_GetError());
 				l->storage_error_logged = 1;
 			}
-			Aeron_CommandBufferSetFailure(cmd, "2D draw-list storage allocation failed");
+			Aeron_CommandBufferSetFailure(cmd, "2D draw-list instance allocation failed");
 			return 0;
 		}
 		Aeron_DestroyBuffer(*buffer);
@@ -704,7 +772,7 @@ static int dl2d_upload_storage(AeronDrawList2D* l, AeronCommandBuffer* cmd, Aero
 	}
 	if (!Aeron_UploadBufferDataCmd(cmd, *buffer, 0, data, required)) {
 		if (!l->storage_error_logged) {
-			Aeron_LogError("aeron.scene", "drawlist2d storage upload failed (%u bytes): %s", required,
+			Aeron_LogError("aeron.scene", "drawlist2d instance upload failed (%u bytes): %s", required,
 						   SDL_GetError());
 			l->storage_error_logged = 1;
 		}
@@ -713,17 +781,32 @@ static int dl2d_upload_storage(AeronDrawList2D* l, AeronCommandBuffer* cmd, Aero
 	return 1;
 }
 
+/* List corners in vertex order: two triangles BL,BR,TL + BR,TR,TL
+ * (matches the old SV_VertexID mapping cx = vid & 1,
+ * cy = (vid >> 1) & 1). */
+static const float blit2d_corners[6][2] = {
+	{ 0.0f, 0.0f }, { 1.0f, 0.0f }, { 0.0f, 1.0f },
+	{ 1.0f, 0.0f }, { 1.0f, 1.0f }, { 0.0f, 1.0f },
+};
+
 int AeronDrawList_Prepare(AeronDrawList2D* l, AeronCommandBuffer* cmd) {
 	if (!l || !cmd || !l->active) {
 		return 0;
 	}
-	l->instance_count    = 0;
+	l->instance_count    = 0; /* counts VERTICES now (6 per sprite) */
 	l->rr_instance_count = 0;
 	for (int i = 0; i < l->count; ++i) {
 		Dl2dRecord* r = &l->records[i];
 		if (r->kind == DL2D_SPRITE) {
-			r->instance_index                 = l->instance_count;
-			l->instances[l->instance_count++] = r->u.quad;
+			/* instance_index stays the sprite ordinal; the vertex
+			 * buffer holds 6 vertices per sprite. */
+			r->instance_index = l->instance_count / 6;
+			for (int c = 0; c < 6; ++c) {
+				Blit2DVertex* v = &l->instances[l->instance_count++];
+				v->quad         = r->u.quad;
+				v->corner_x     = blit2d_corners[c][0];
+				v->corner_y     = blit2d_corners[c][1];
+			}
 		} else if (r->kind == DL2D_RRECT) {
 			r->instance_index                       = l->rr_instance_count;
 			l->rr_instances[l->rr_instance_count++] = r->u.rrect;
@@ -731,13 +814,13 @@ int AeronDrawList_Prepare(AeronDrawList2D* l, AeronCommandBuffer* cmd) {
 	}
 	l->prepared = 0;
 	if (l->instance_count > 0 &&
-		!dl2d_upload_storage(l, cmd, &l->instance_buffer, &l->instance_buffer_capacity, l->instances,
+		!dl2d_upload_instances(l, cmd, &l->instance_buffer, &l->instance_buffer_capacity, l->instances,
 							 l->instance_count * (uint32_t)sizeof *l->instances,
 							 "scene.draw_list2d.instances")) {
 		return 0;
 	}
 	if (l->rr_instance_count > 0 &&
-		!dl2d_upload_storage(l, cmd, &l->rr_instance_buffer, &l->rr_instance_buffer_capacity, l->rr_instances,
+		!dl2d_upload_instances(l, cmd, &l->rr_instance_buffer, &l->rr_instance_buffer_capacity, l->rr_instances,
 							 l->rr_instance_count * (uint32_t)sizeof *l->rr_instances,
 							 "scene.draw_list2d.rrect_instances")) {
 		return 0;
@@ -777,7 +860,7 @@ static int draw_list_encode(AeronDrawList2D* l, AeronRenderPass* pass, AeronRend
 	const Blit2DRunUniform   run_base         = {
 		.ndc_scale        = { 2.0f / (float)l->target_w, 2.0f / (float)l->target_h },
 		.output_rgb_scale = output_rgb_scale,
-		.base_instance    = 0,
+		._pad            = 0,
 	};
 
 	const AeronRectI full_scissor = { 0, 0, l->target_w, l->target_h };
@@ -797,12 +880,12 @@ static int draw_list_encode(AeronDrawList2D* l, AeronRenderPass* pass, AeronRend
 				return 0;
 			}
 			Blit2DRunUniform run = run_base;
-			run.base_instance    = r->instance_index;
 			Aeron_BindGraphicsPipeline(pass, pipe);
 			Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_FRAGMENT, 0, r->texture, sampler);
-			Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_VERTEX, 0, l->instance_buffer);
+			Aeron_BindVertexBuffer(pass, 0, l->instance_buffer,
+			                       r->instance_index * 6u * (uint32_t)sizeof(Blit2DVertex));
 			Aeron_BindUniformData(pass, AERON_SHADER_STAGE_VERTEX, 0, &run, sizeof run);
-			Aeron_DrawInstanced(pass, 4, (uint32_t)(end - i), 0);
+			Aeron_Draw(pass, 6 * (uint32_t)(end - i), 0);
 			i = end;
 			continue;
 		}
@@ -816,9 +899,9 @@ static int draw_list_encode(AeronDrawList2D* l, AeronRenderPass* pass, AeronRend
 				return 0;
 			}
 			Blit2DRunUniform run = run_base;
-			run.base_instance    = r->instance_index;
 			Aeron_BindGraphicsPipeline(pass, pipe);
-			Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_VERTEX, 0, l->rr_instance_buffer);
+			Aeron_BindVertexBuffer(pass, 0, l->rr_instance_buffer,
+			                       r->instance_index * (uint32_t)sizeof(Blit2DRRectInstance));
 			Aeron_BindUniformData(pass, AERON_SHADER_STAGE_VERTEX, 0, &run, sizeof run);
 			Aeron_DrawInstanced(pass, 4, (uint32_t)(end - i), 0);
 			i = end;

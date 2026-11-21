@@ -85,6 +85,8 @@ FSOut main(PbrForwardVSOut i, bool is_front : SV_IsFrontFace)
 {
     FSOut _out;
 
+
+
     /* ===== Material resolution =================================== */
     GltfMaterial m = pbr_resolve_material(
         i.prim_id, i.variant_row_base, i.variant_group_count,
@@ -242,10 +244,12 @@ FSOut main(PbrForwardVSOut i, bool is_front : SV_IsFrontFace)
 
     float3 lit = base_rgb + spec_rgb;
 
+#if AERON_PBR_CLUSTER
     if (fs_cluster_debug_view != 0u && fs_cluster_enabled != 0u) {
         _out.color = float4(clustered_light_debug_color(i.position.xy, i.world_pos), 1.0f);
         return _out;
     }
+#endif
 
     /* ===== XvT flat-shading override ============================
      * Replace the full PBR composition with a diffuse-only flat
@@ -354,6 +358,10 @@ FSOut main(PbrForwardVSOut i, bool is_front : SV_IsFrontFace)
         }
         float emissive_mul = i.emissive_mul;
         emissive *= m.emissive_packed.a * emissive_mul;
+        // Volky: material emissive is too bright on the GLES shim — the
+        // hangar light strips blow out into bright lines; halve it
+        // (device-confirmed v128). Path A (laser projectiles) is untouched.
+        emissive *= 0.5f;
         if ((m.flags & GLTF_MATERIAL_LEGACY_EMISSIVE) != 0u) {
             lit = emissive + lit * (1.0f - saturate(emissive_coverage * emissive_mul));
         } else {

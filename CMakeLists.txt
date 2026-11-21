@@ -226,6 +226,8 @@ set(AERON_SHADER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_sky_cube.frag.hlsl
     # aeron_scene bloom chain + the shared fullscreen-quad VS.
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_fullscreen_quad.vert.hlsl
+    # v67: flight-only Y-flipped quad VS (fl_draw_present only).
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_fullscreen_quad_flip.vert.hlsl
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_bloom_brightpass.frag.hlsl
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_bloom_downsample.frag.hlsl
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/scene_bloom_upsample.frag.hlsl

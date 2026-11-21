@@ -15,6 +15,17 @@
 #ifndef AERON_SCENE_PBR_LIGHTING_INCLUDED
 #define AERON_SCENE_PBR_LIGHTING_INCLUDED
 
+/* Clustered point lights (AERON_PBR_CLUSTER 1, the default) need the
+ * compute pipeline: the host's clustered-lights compute pass fills
+ * the cluster header/index buffers. On backends without compute
+ * (e.g. the GLES shim) those buffers are never populated, and the
+ * cluster SSBO reads break the compiled fragment program even when
+ * never executed — so the shim build defines AERON_PBR_CLUSTER 0
+ * and the brute-force fallback in accumulate_point_lights is used. */
+#ifndef AERON_PBR_CLUSTER
+#define AERON_PBR_CLUSTER 1
+#endif
+
 #ifndef AERON_DIRECTIONAL_SHADOW_ONLY
 struct PbrMaterialParams
 {
@@ -81,7 +92,9 @@ struct PbrPointLight
 #ifndef AERON_PBR_POINT_LIGHT_REGISTER
 #define AERON_PBR_POINT_LIGHT_REGISTER t9
 #endif
-StructuredBuffer<PbrPointLight> fs_point_lights : register(AERON_PBR_POINT_LIGHT_REGISTER, space2);
+/* Fragment SSBO as RGBA32F lookup texture (GLES: no fragment storage
+ * blocks). 2 texels per light: (0, i) = position_range, (1, i) = color. */
+Texture2D<float4> fs_point_lights_tex : register(AERON_PBR_POINT_LIGHT_REGISTER, space2);
 #include "scene_clustered_lights.hlsli"
 #endif
 
@@ -618,7 +631,9 @@ void accumulate_point_light(uint light_index, float3 N, float3 N_spec, float3 V,
     float  min_d = max(fs_point_params.x, 1.0f);
     float  wrap  = fs_point_params.z;
     float  cap   = fs_point_params.w;
-    PbrPointLight point_light = fs_point_lights[light_index];
+    PbrPointLight point_light;
+    point_light.position_range = fs_point_lights_tex.Load(int3(0, light_index, 0));
+    point_light.color = fs_point_lights_tex.Load(int3(1, light_index, 0));
     float3 dv = point_light.position_range.xyz - world_pos;
     float  r  = point_light.position_range.w;
     float  d2 = dot(dv, dv);
@@ -653,6 +668,7 @@ float3 accumulate_point_lights(float3 N, float3 N_spec, float3 V, float3 world_p
                                inout float3 spec_out)
 {
     float3 diff = float3(0.0f, 0.0f, 0.0f);
+#if AERON_PBR_CLUSTER
     if (fs_cluster_enabled != 0u) {
         uint global_count = min(fs_cluster_global_count, AERON_CLUSTER_MAX_GLOBAL_LIGHTS);
         for (uint gi = 0u; gi < global_count; ++gi) {
@@ -670,11 +686,14 @@ float3 accumulate_point_lights(float3 N, float3 N_spec, float3 V, float3 world_p
                                    mp, spec_mul, diff, spec_out);
         }
     } else {
+#endif
         for (uint light_index = 0u; light_index < fs_cluster_point_count; ++light_index) {
             accumulate_point_light(light_index, N, N_spec, V, world_pos,
                                    mp, spec_mul, diff, spec_out);
         }
+#if AERON_PBR_CLUSTER
     }
+#endif
     return diff;
 }
 #endif

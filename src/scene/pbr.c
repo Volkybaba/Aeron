@@ -152,6 +152,9 @@ static AeronGraphicsPipeline* pbr_pipeline_create(struct AeronScene3D* s, int ki
 	const PbrTargetDesc pre2[2]   = { normal_rw, vel_rw };
 	const PbrTargetDesc pre3[3]   = { normal_rw, vel_rw, depth_rw };
 
+	/* v87: depth test ON for the opaque PBR kinds (v86-diag turned it
+	 * OFF as a diagnostic; the flat-red test proved the vertex path
+	 * works, and the UBO cross-wiring fix is the real fix). */
 	switch (kind) {
 		case AERON_PBR_PIPE_MESH:
 			return pbr_pipeline(s->pbr_vs, color_fs, &color_rw, 1, 1, 1, AERON_COMPARE_GREATER_EQUAL, cull, 0,
@@ -320,10 +323,10 @@ int AeronScenePbr_Ensure(struct AeronScene3D* s) {
 	}
 	s->pbr_tried = 1;
 
-	s->pbr_vs               = pbr_shader("scene_pbr_mesh.vert", AERON_SHADER_STAGE_VERTEX, 0, 1, 2);
-	s->pbr_prepass_vs       = pbr_shader("scene_pbr_prepass.vert", AERON_SHADER_STAGE_VERTEX, 0, 1, 1);
-	s->pbr_prepass_mask_vs  = pbr_shader("scene_pbr_prepass_mask.vert", AERON_SHADER_STAGE_VERTEX, 0, 1, 1);
-	s->pbr_prepass_stamp_vs = pbr_shader("scene_pbr_prepass_stamp.vert", AERON_SHADER_STAGE_VERTEX, 0, 1, 1);
+	s->pbr_vs               = pbr_shader("scene_pbr_mesh.vert", AERON_SHADER_STAGE_VERTEX, 2, 1, 0);
+	s->pbr_prepass_vs       = pbr_shader("scene_pbr_prepass.vert", AERON_SHADER_STAGE_VERTEX, 1, 1, 0);
+	s->pbr_prepass_mask_vs  = pbr_shader("scene_pbr_prepass_mask.vert", AERON_SHADER_STAGE_VERTEX, 1, 1, 0);
+	s->pbr_prepass_stamp_vs = pbr_shader("scene_pbr_prepass_stamp.vert", AERON_SHADER_STAGE_VERTEX, 1, 1, 0);
 	s->pbr_fs               = pbr_shader("scene_pbr_mesh.frag", AERON_SHADER_STAGE_FRAGMENT, 8, 3, 5);
 	s->pbr_mask_fs          = pbr_shader("scene_pbr_mesh_mask.frag", AERON_SHADER_STAGE_FRAGMENT, 8, 3, 5);
 	s->pbr_prepass_fs       = pbr_shader("scene_pbr_prepass.frag", AERON_SHADER_STAGE_FRAGMENT, 0, 0, 0);
@@ -486,20 +489,28 @@ static void pbr_bind_ao(struct AeronScene3D* s, AeronRenderPass* pass, AeronText
 							 s->pbr_environment_map ? s->pbr_environment_map
 													: AeronSceneInternal_WhiteCubeTexture(),
 							 s->pbr_environment_sampler ? s->pbr_environment_sampler : s->pbr_sampler);
-	Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_FRAGMENT, 2, s->point_light_buffer);
+	Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_FRAGMENT, 10, s->point_light_texture,
+							 s->mesh_table_sampler);
 	AeronSceneClusteredLights_Bind(s, pass);
 }
 
 static void pbr_bind_material_resources(AeronRenderPass* pass, const AeronSceneMesh* mesh,
-										AeronSampler* atlas_sampler, int all_channels) {
+										AeronSampler* atlas_sampler, AeronSampler* lookup_sampler,
+										int all_channels) {
 	const uint32_t channel_count = all_channels ? AERON_GLTF_CHANNEL_COUNT : 1u;
 	for (uint32_t channel = 0; channel < channel_count; ++channel) {
 		Aeron_BindTextureSampler(
 			pass, AERON_SHADER_STAGE_FRAGMENT, channel,
 			mesh->atlas[channel] ? mesh->atlas[channel] : AeronSceneInternal_WhiteTexture(), atlas_sampler);
 	}
-	Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_FRAGMENT, 0, mesh->material_buffer);
-	Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_FRAGMENT, 1, mesh->variant_buffer);
+	/* Material/variant lookup textures at sampler slots 8/9 (t8/t9 in the
+	 * PBR fragment shaders, unified across mesh/prepass/shadow pipelines).
+	 * They are single-level (mip_count = 1) RGBA32F lookup textures read
+	 * with texelFetch, so they MUST use the NEAREST (non-mipmap) lookup
+	 * sampler: a mipmap sampler makes the texture INCOMPLETE on GLES
+	 * (no mip levels beyond 0 exist) and sampling returns (0,0,0,1). */
+	Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_FRAGMENT, 8, mesh->material_texture, lookup_sampler);
+	Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_FRAGMENT, 9, mesh->variant_texture, lookup_sampler);
 }
 
 int AeronScenePbr_DrawInstances(struct AeronScene3D* s, AeronCommandBuffer* cmd, AeronRenderPass* pass,
@@ -517,9 +528,11 @@ int AeronScenePbr_DrawInstances(struct AeronScene3D* s, AeronCommandBuffer* cmd,
 	}
 	AeronCullMode bound_cull = AERON_CULL_NONE;
 	Aeron_BindGraphicsPipeline(pass, pipeline);
-	Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_VERTEX, 0, s->mesh_table_buffer);
+	Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_VERTEX, 0, s->mesh_table_texture,
+						 s->mesh_table_sampler);
 	if (!depth_only) {
-		Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_VERTEX, 1, s->local_light_buffer);
+		Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_VERTEX, 1, s->local_light_texture,
+						 s->mesh_table_sampler);
 	}
 	/* AO input at t4 (pbr FS declares it unconditionally); a white 1x1
 	 * placeholder keeps AO reading as 1 when SSAO is off. Prepass FS
@@ -570,7 +583,7 @@ int AeronScenePbr_DrawInstances(struct AeronScene3D* s, AeronCommandBuffer* cmd,
 			Aeron_BindVertexBuffer(pass, 0, m->vbo, 0);
 			Aeron_BindIndexBuffer(pass, m->ibo, AERON_INDEX_FORMAT_UINT16, 0);
 			if (!depth_only) {
-				pbr_bind_material_resources(pass, m, atlas_sampler, 1);
+				pbr_bind_material_resources(pass, m, atlas_sampler, s->mesh_table_sampler, 1);
 			}
 		}
 
@@ -621,7 +634,7 @@ int AeronScenePbr_DrawInstances(struct AeronScene3D* s, AeronCommandBuffer* cmd,
 				bound_mesh = m;
 				Aeron_BindVertexBuffer(pass, 0, m->vbo, 0);
 				Aeron_BindIndexBuffer(pass, m->ibo, AERON_INDEX_FORMAT_UINT16, 0);
-				pbr_bind_material_resources(pass, m, atlas_sampler, !depth_only);
+				pbr_bind_material_resources(pass, m, atlas_sampler, s->mesh_table_sampler, !depth_only);
 			}
 			pbr_push_instance_uniforms(s, pass, in, m, &s->prepared_instances[i], velocity, depth_only,
 									   screen_shadow);
@@ -663,13 +676,21 @@ int AeronScenePbr_DrawInstances(struct AeronScene3D* s, AeronCommandBuffer* cmd,
 				Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_FRAGMENT, 0,
 										 m->atlas[0] ? m->atlas[0] : AeronSceneInternal_WhiteTexture(),
 										 atlas_sampler);
-				Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_FRAGMENT, 0, m->material_buffer);
-				Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_FRAGMENT, 1, m->variant_buffer);
+				Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_FRAGMENT, 8, m->material_texture,
+											 s->mesh_table_sampler);
+				Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_FRAGMENT, 9, m->variant_texture,
+											 s->mesh_table_sampler);
 			}
 			pbr_push_instance_uniforms(s, pass, in, m, &s->prepared_instances[i],
 									   /*velocity=*/1, /*depth_only=*/1,
 									   /*screen_shadow=*/0);
-			Aeron_DrawIndexed(pass, m->blend_index_count, m->blend_index_offset, 0);
+			/* first_prim_only (XWA bolts): stamp only the first prim's
+			 * velocity so it matches the visible single ribbon. */
+			Aeron_DrawIndexed(pass,
+							  (in->first_prim_only && m->first_prim_blend_count > 0)
+								  ? m->first_prim_blend_count
+								  : m->blend_index_count,
+							  m->blend_index_offset, 0);
 		}
 	}
 	return 1;
@@ -684,8 +705,10 @@ int AeronScenePbr_DrawTransparentInstances(struct AeronScene3D* s, AeronRenderPa
 	if (s->instance_count == 0) {
 		return 1;
 	}
-	Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_VERTEX, 0, s->mesh_table_buffer);
-	Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_VERTEX, 1, s->local_light_buffer);
+	Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_VERTEX, 0, s->mesh_table_texture,
+						 s->mesh_table_sampler);
+	Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_VERTEX, 1, s->local_light_texture,
+						 s->mesh_table_sampler);
 	/* Screen-space AO belongs to the nearest opaque/masked depth layer, not
 	 * this later transparent layer. Bind white while preserving the already
 	 * shaded background's AO. */
@@ -724,12 +747,34 @@ int AeronScenePbr_DrawTransparentInstances(struct AeronScene3D* s, AeronRenderPa
 			bound_mesh = m;
 			Aeron_BindVertexBuffer(pass, 0, m->vbo, 0);
 			Aeron_BindIndexBuffer(pass, m->ibo, AERON_INDEX_FORMAT_UINT16, 0);
-			pbr_bind_material_resources(pass, m, atlas_sampler, 1);
+			pbr_bind_material_resources(pass, m, atlas_sampler, s->mesh_table_sampler, 1);
 		}
 		pbr_push_instance_uniforms(s, pass, in, m, &s->prepared_instances[i],
 								   /*velocity=*/0, /*depth_only=*/0,
 								   /*screen_shadow=*/0);
-		Aeron_DrawIndexed(pass, m->blend_index_count, m->blend_index_offset, 0);
+		/* first_prim_only (XWA bolts): draw only the first prim's
+		 * blend range. The bolt OPT's prim 0 is a single ribbon
+		 * (DIAG-GEO). The X users saw is NOT tearing (the v91
+		 * VSYNC lib did not remove it) and NOT a second mesh
+		 * draw (DIAG4/DIAG5: one draw per bolt per frame);
+		 * the second strip comes from a path DIAG has not
+		 * covered yet — see DIAG6 (flight.c). Falls back to
+		 * the whole range when the mesh has no recorded
+		 * first-prim range. */
+		{
+			uint32_t draw_count = m->blend_index_count;
+			/* 1.1.4: velocity stamp OFF for bolts (see flight.c) — the
+			 * thick strip was the velocity prepass leaking to screen.
+			 * Draw only the first prim (single ribbon, DIAG-GEO). */
+			if (in->first_prim_only) {
+				if (m->first_prim_blend_count > 0 &&
+				    m->first_prim_blend_count < m->blend_index_count)
+					draw_count = m->first_prim_blend_count;
+				else if (m->blend_index_count >= 6)
+					draw_count = m->blend_index_count / 2;
+			}
+			Aeron_DrawIndexed(pass, draw_count, m->blend_index_offset, 0);
+		}
 	}
 	(void)ao_tex;
 	return 1;

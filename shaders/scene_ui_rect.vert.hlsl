@@ -1,8 +1,10 @@
 /*
- * UI rounded-rect vertex shader — storage-backed instanced TRIANGLESTRIP
- * quads, one analytic rounded rect per instance.
+ * UI rounded-rect vertex shader — instanced TRIANGLESTRIP quads via
+ * per-instance vertex attributes (no storage buffer: GLES vertex
+ * stages allow zero storage blocks), one analytic rounded rect per
+ * instance.
  *
- * Storage layout MUST match Blit2DRRectInstance in draw_list2d.c:
+ * Attribute layout MUST match Blit2DRRectInstance in draw_list2d.c:
  *   dst_rect    : (x, y, w, h)                  target pixels, top-left + size
  *   params      : (radius, border, bevel, soft) all in pixels
  *   fill_top    : (r, g, b, a)                  PMA
@@ -29,13 +31,23 @@ struct RRectInstance
     float4 bevel_lo;
 };
 
-StructuredBuffer<RRectInstance> rects : register(t0, space0);
+/* Per-instance attributes (locations 0..6, one float4 each). */
+struct VSIn
+{
+    float4 dst_rect    : TEXCOORD0;
+    float4 params      : TEXCOORD1;
+    float4 fill_top    : TEXCOORD2;
+    float4 fill_bottom : TEXCOORD3;
+    float4 border_col  : TEXCOORD4;
+    float4 bevel_hi    : TEXCOORD5;
+    float4 bevel_lo    : TEXCOORD6;
+};
 
 cbuffer BlitRun : register(b0, space1)
 {
     float2 ndc_scale;
     float  output_rgb_scale;
-    uint   base_instance;
+    uint   _pad; /* reserved; instance offset is the bound vertex-buffer offset */
 };
 
 struct VSOut
@@ -50,9 +62,16 @@ struct VSOut
     nointerpolation float4 bevel_lo    : TEXCOORD6;
 };
 
-VSOut main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
+VSOut main(VSIn input, uint vid : SV_VertexID)
 {
-    RRectInstance u = rects[base_instance + iid];
+    RRectInstance u;
+    u.dst_rect    = input.dst_rect;
+    u.params      = input.params;
+    u.fill_top    = input.fill_top;
+    u.fill_bottom = input.fill_bottom;
+    u.border_col  = input.border_col;
+    u.bevel_hi    = input.bevel_hi;
+    u.bevel_lo    = input.bevel_lo;
 
     float cx = (float)(vid & 1u);
     float cy = (float)((vid >> 1u) & 1u);

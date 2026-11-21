@@ -48,7 +48,11 @@ static void scene_mat4_perspective_reverse_z_xy(float m[16], float h_half, float
 	memset(m, 0, sizeof(float) * 16);
 	m[0] = 1.0f / tanf(h_half);
 	m[2] = proj_x_offset;
-	/* Negated for the engine eye-y-down convention. */
+	/* GLES/shim: Y scale pozitif (Vulkan'da negatif). Vulkan NDC Y-asagi,
+	 * GLSL NDC Y-yukari; negatif Y 3D'yi FBO'da ters cizip composite'un
+	 * (Vulkan yonelimi bekleyen) ters gostermesine yol aciyordu. Pozitif
+	 * Y, 3D'yi FBO'da duz cizdirir. Goge gore eye-y-down convention
+	 * degismedi; sadece clip-space Y isareti GLES'e uyarlandi. */
 	m[5]  = -1.0f / tanf(v_half);
 	m[6]  = proj_y_offset;
 	m[11] = near_z;
@@ -991,6 +995,40 @@ static int scene_storage_ensure_buffer(AeronBuffer** buffer, uint32_t* capacity,
 	return scene_storage_ensure_buffer_usage(buffer, capacity, required, AERON_BUFFER_USAGE_STORAGE, name);
 }
 
+/* Lookup-table texture (RGBA32F, texelFetch): width is fixed (float4s per
+ * record), height grows with the record count. Recreated when the count
+ * outgrows the current height. */
+static int scene_storage_ensure_texture(AeronTexture** texture, uint32_t* height_cap, int width,
+							uint32_t required_height, const char* name) {
+	if (*texture && *height_cap >= required_height) {
+		return 1;
+	}
+	uint32_t new_height = *height_cap ? *height_cap : 1u;
+	while (new_height < required_height) {
+		if (new_height > UINT32_MAX / 2u) {
+			new_height = required_height;
+			break;
+		}
+		new_height *= 2u;
+	}
+	AeronTexture* replacement = Aeron_CreateTexture(&(AeronTextureDesc) {
+		.width      = width,
+		.height     = (int)new_height,
+		.mip_count  = 1,
+		.format     = AERON_TEXTURE_FORMAT_RGBA32_FLOAT,
+		.usage      = AERON_TEXTURE_USAGE_SAMPLED | AERON_TEXTURE_USAGE_TRANSFER_DST,
+		.cube       = 0,
+		.debug_name = name,
+	});
+	if (!replacement) {
+		return 0;
+	}
+	Aeron_DestroyTexture(*texture);
+	*texture    = replacement;
+	*height_cap = new_height;
+	return 1;
+}
+
 static void scene_storage_report_failure(AeronScene3D* s, const char* resource, uint32_t bytes) {
 	if (!s->storage_error_logged) {
 		Aeron_LogError("aeron.scene", "%s preparation failed (%u bytes): %s", resource, bytes,
@@ -1139,18 +1177,36 @@ int AeronSceneStorage_Prepare(AeronScene3D* s, AeronCommandBuffer* cmd) {
 	const uint32_t cluster_light_bytes =
 		(s->cluster_light_count ? s->cluster_light_count : (s->point_light_count ? 1u : 0u)) *
 		(uint32_t)sizeof *s->cluster_light_staging;
-	if (!scene_storage_ensure_buffer(&s->mesh_table_buffer, &s->mesh_table_buffer_cap, table_bytes,
-									 "scene.mesh_tables")) {
+	if (!s->mesh_table_sampler) {
+		s->mesh_table_sampler = Aeron_CreateSampler(&(AeronSamplerDesc) {
+			.min_filter = AERON_FILTER_NEAREST,
+			.mag_filter = AERON_FILTER_NEAREST,
+			.mip_filter = AERON_FILTER_NEAREST,
+			.address_u  = AERON_ADDRESS_CLAMP_TO_EDGE,
+			.address_v  = AERON_ADDRESS_CLAMP_TO_EDGE,
+			.address_w  = AERON_ADDRESS_CLAMP_TO_EDGE,
+		});
+		if (!s->mesh_table_sampler) {
+			scene_storage_report_failure(s, "scene.mesh_tables.sampler", 0);
+			return 0;
+		}
+	}
+	if (!scene_storage_ensure_texture(&s->mesh_table_texture, &s->mesh_table_texture_h,
+							  AERON_MESH_TABLE_STRIDE_VEC4,
+							  s->mesh_table_count ? s->mesh_table_count : 1u,
+							  "scene.mesh_tables")) {
 		scene_storage_report_failure(s, "scene.mesh_tables", table_bytes);
 		return 0;
 	}
-	if (!scene_storage_ensure_buffer(&s->local_light_buffer, &s->local_light_buffer_cap, local_bytes,
-									 "scene.local_lights")) {
+	if (!scene_storage_ensure_texture(&s->local_light_texture, &s->local_light_texture_h, 2,
+							  s->local_light_count ? s->local_light_count : 1u,
+							  "scene.local_lights")) {
 		scene_storage_report_failure(s, "scene.local_lights", local_bytes);
 		return 0;
 	}
-	if (!scene_storage_ensure_buffer(&s->point_light_buffer, &s->point_light_buffer_cap, point_bytes,
-									 "scene.point_lights")) {
+	if (!scene_storage_ensure_texture(&s->point_light_texture, &s->point_light_texture_h, 2,
+								  s->point_light_count ? s->point_light_count : 1u,
+								  "scene.point_lights")) {
 		scene_storage_report_failure(s, "scene.point_lights", point_bytes);
 		return 0;
 	}
@@ -1161,17 +1217,41 @@ int AeronSceneStorage_Prepare(AeronScene3D* s, AeronCommandBuffer* cmd) {
 		scene_storage_report_failure(s, "scene.cluster_lights", cluster_light_bytes);
 		return 0;
 	}
-	AeronBufferUploadDesc uploads[4] = {
-		{ s->mesh_table_buffer, 0, s->mesh_table_staging, table_bytes },
-		{ s->local_light_buffer, 0, s->local_light_staging, local_bytes },
-		{ s->point_light_buffer, 0, s->point_light_staging, point_bytes },
-	};
-	uint32_t upload_count = 3;
+	AeronBufferUploadDesc uploads[4];
+	uint32_t upload_count = 0;
 	if (cluster_light_bytes > 0) {
 		uploads[upload_count++] = (AeronBufferUploadDesc) { s->cluster_light_buffer, 0,
 															s->cluster_light_staging, cluster_light_bytes };
 	}
-	s->storage_ready = Aeron_UploadBufferBatchCmd(cmd, uploads, upload_count);
+	s->storage_ready = upload_count > 0
+		? Aeron_UploadBufferBatchCmd(cmd, uploads, upload_count)
+		: 1;
+	if (s->storage_ready) {
+		AeronTextureUploadDesc tex_uploads[3] = {
+			{ .texture  = s->mesh_table_texture,
+			  .mip_level = 0, .x = 0, .y = 0,
+			  .width     = AERON_MESH_TABLE_STRIDE_VEC4,
+			  .height    = (int)s->mesh_table_count,
+			  .raw_data  = s->mesh_table_staging,
+			  .raw_size  = table_bytes,
+			  .cycle     = 1 },
+			{ .texture  = s->local_light_texture,
+			  .mip_level = 0, .x = 0, .y = 0,
+			  .width     = 2,
+			  .height    = (int)(s->local_light_count ? s->local_light_count : 1u),
+			  .raw_data  = s->local_light_staging,
+			  .raw_size  = local_bytes,
+			  .cycle     = 1 },
+			{ .texture  = s->point_light_texture,
+			  .mip_level = 0, .x = 0, .y = 0,
+			  .width     = 2,
+			  .height    = (int)(s->point_light_count ? s->point_light_count : 1u),
+			  .raw_data  = s->point_light_staging,
+			  .raw_size  = point_bytes,
+			  .cycle     = 1 },
+		};
+		s->storage_ready = Aeron_UploadTextureBatchCmd(cmd, tex_uploads, 3);
+	}
 	if (!s->storage_ready) {
 		scene_storage_report_failure(s, "scene.dynamic_storage", table_bytes + local_bytes + point_bytes);
 	} else {
@@ -1197,17 +1277,22 @@ void AeronSceneStorage_Release(AeronScene3D* s) {
 	if (!s) {
 		return;
 	}
-	Aeron_DestroyBuffer(s->mesh_table_buffer);
-	Aeron_DestroyBuffer(s->local_light_buffer);
-	Aeron_DestroyBuffer(s->point_light_buffer);
+	Aeron_DestroyTexture(s->mesh_table_texture);
+	Aeron_DestroyTexture(s->local_light_texture);
+	Aeron_DestroySampler(s->mesh_table_sampler);
+	Aeron_DestroyTexture(s->point_light_texture);
 	Aeron_DestroyBuffer(s->cluster_light_buffer);
 	free(s->mesh_table_staging);
 	free(s->local_light_staging);
 	free(s->point_light_staging);
 	free(s->cluster_light_staging);
-	s->mesh_table_buffer     = NULL;
-	s->local_light_buffer    = NULL;
-	s->point_light_buffer    = NULL;
+	s->mesh_table_texture    = NULL;
+	s->mesh_table_texture_h  = 0;
+	s->local_light_texture   = NULL;
+	s->local_light_texture_h = 0;
+	s->mesh_table_sampler    = NULL;
+	s->point_light_texture   = NULL;
+	s->point_light_texture_h = 0;
 	s->cluster_light_buffer  = NULL;
 	s->mesh_table_staging    = NULL;
 	s->local_light_staging   = NULL;

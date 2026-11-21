@@ -86,11 +86,13 @@ void                    AeronScenePresentChain_Destroy(AeronScenePresentChain* c
  * image height; (rt_w, rt_h) are the source dimensions.
  * `src_coverage` != 0 weights the PMA coverage by the scene texel's
  * own alpha — for PiP targets with a transparent background; pass 0
- * for a full-frame present. */
+ * for a full-frame present.
+ * `flip_y` != 0 draws with the Y-flipped quad variant (v67, flight
+ * present only); pass 0 everywhere else. */
 void AeronScenePresentChain_Draw(AeronScenePresentChain* chain, AeronRenderPass* pass,
 								 AeronTexture* scene_tex, AeronSampler* sampler, AeronTexture* bloom_tex,
 								 float bloom_intensity, int rt_w, int rt_h, float bar_y_uv,
-								 const float tint[4], int src_coverage);
+								 const float tint[4], int src_coverage, int flip_y);
 
 #ifdef __cplusplus
 }

@@ -1,10 +1,21 @@
 /*
- * Rect-blit vertex shader — storage-backed instanced TRIANGLESTRIP quads.
+ * Rect-blit vertex shader — plain per-vertex TRIANGLELIST quads.
  *
- * One draw produces N quads via SDL_DrawGPUPrimitives(4, N, 0, 0).
- * Each instance reads its pixel-space quad data from a storage buffer.
+ * Each sprite is expanded by the C side into six vertices carrying
+ * the full sprite payload (dst/src/tint/bias/trap) plus a list
+ * corner attribute (0,0),(1,0),(0,1) + (1,0),(1,1),(0,1). No
+ * instancing and no SV_VertexID: both proved unreliable on the GLES
+ * shim (Mali) — the instanced-attribute + VertexID variant drew zero
+ * pixels even with a fixed-quad magenta fragment shader, so the
+ * corner now rides an ordinary vertex attribute and the draw is a
+ * plain DrawPrimitives. A strip would not restart between quads
+ * (bridging triangles overdraw glyphs with the next sprite's UVs),
+ * hence the list.
  *
- * Storage layout MUST match Blit2DInstance in draw_list2d.c:
+ * One draw produces N quads via SDL_DrawGPUPrimitives(6*N, 0).
+ * The bound vertex-buffer offset selects the run's first vertex.
+ *
+ * Attribute layout MUST match Blit2DVertex in draw_list2d.c:
  *   dst_rect : (x, y, w, h)        target pixels, top-left + size
  *   src_rect : (u0, v0, u1, v1)    texture UV
  *   tint     : (r, g, b, a)        multiplier
@@ -13,6 +24,7 @@
  *                                  pixel-space top-edge horizontal
  *                                  inset + per-corner projective w
  *                                  for hyperbolic UV interpolation
+ *   corner   : (cx, cy)            strip corner, (0,0),(1,0),(0,1),(1,1)
  */
 
 struct BlitUniforms
@@ -24,13 +36,22 @@ struct BlitUniforms
     float4 trap;
 };
 
-StructuredBuffer<BlitUniforms> quads : register(t0, space0);
+/* Per-vertex attributes (locations 0..5). */
+struct VSIn
+{
+    float4 dst_rect : TEXCOORD0;
+    float4 src_rect : TEXCOORD1;
+    float4 tint     : TEXCOORD2;
+    float4 bias     : TEXCOORD3;
+    float4 trap     : TEXCOORD4;
+    float2 corner   : TEXCOORD5;
+};
 
 cbuffer BlitRun : register(b0, space1)
 {
     float2 ndc_scale;
     float  output_rgb_scale;
-    uint   base_instance;
+    uint   _pad; /* reserved; instance offset is the bound vertex-buffer offset */
 };
 
 struct VSOut
@@ -41,16 +62,24 @@ struct VSOut
     float4 bias     : TEXCOORD2;
 };
 
-VSOut main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
+VSOut main(VSIn input)
 {
-    BlitUniforms u = quads[base_instance + iid];
+    BlitUniforms u;
+    u.dst_rect = input.dst_rect;
+    u.src_rect = input.src_rect;
+    u.tint     = input.tint;
+    u.bias     = input.bias;
+    u.trap     = input.trap;
 
-    float cx = (float)(vid & 1u);
-    float cy = (float)((vid >> 1u) & 1u);
+    float cx = input.corner.x;
+    float cy = input.corner.y;
 
     float2 pos_px = u.dst_rect.xy + float2(cx, 1.0f - cy) * u.dst_rect.zw;
     /* Trapezoid top-edge horizontal inset. (0, 0) = pass-through. */
     pos_px.x += cy * lerp(u.trap.x, u.trap.y, cx);
+    /* v68: shim artik flip'i hedef bazinda yapiyor (offscreen FBO ->
+     * program_flip, swapchain -> normal program); oyun tarafi
+     * orijinal Vulkan formulune dondu, cift flip olmasin. */
     float2 pos = float2(pos_px.x * ndc_scale.x - 1.0f,
                         1.0f - pos_px.y * ndc_scale.y);
 

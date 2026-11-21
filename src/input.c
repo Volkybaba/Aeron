@@ -45,7 +45,14 @@ int AeronKey_FromName(const char* name, AeronKey* out_key) {
 	return 1;
 }
 
+/* v96: set when a mouse motion/button event arrives during this frame's
+ * pump; the event path is then authoritative and Aeron_BeginFrame must not
+ * let the platform read overwrite raw_x/raw_y (it jumps back to SDL2's
+ * stale position, e.g. (0,0) after a touch). */
+static int s_mouse_event_this_frame = 0;
+
 void Aeron_BeginInputFrame(AeronInputSnapshot* input) {
+	s_mouse_event_this_frame   = 0;
 	input->key_event_count     = 0;
 	input->key_events_overflow = 0;
 	memset(input->key_pressed, 0, sizeof(input->key_pressed));
@@ -63,6 +70,9 @@ void Aeron_BeginInputFrame(AeronInputSnapshot* input) {
 	input->text_length                  = 0;
 	input->frame_id++;
 }
+
+/* v96: 1 if a mouse motion/button event arrived during this frame's pump. */
+int Aeron_MouseEventThisFrame(void) { return s_mouse_event_this_frame; }
 
 static void Aeron_AppendText(AeronInputSnapshot* input, const char* text) {
 	size_t available;
@@ -208,6 +218,7 @@ void Aeron_HandleEvent(const SDL_Event* event) {
 			Aeron_AppendText(&g_aeron.input, event->text.text);
 			break;
 		case SDL_EVENT_MOUSE_MOTION:
+			s_mouse_event_this_frame = 1;
 			g_aeron.input.mouse.raw_x = (int)event->motion.x;
 			g_aeron.input.mouse.raw_y = (int)event->motion.y;
 			g_aeron.input.mouse.relative_x += event->motion.xrel;
@@ -216,6 +227,7 @@ void Aeron_HandleEvent(const SDL_Event* event) {
 			break;
 		case SDL_EVENT_MOUSE_BUTTON_DOWN:
 		case SDL_EVENT_MOUSE_BUTTON_UP:
+			s_mouse_event_this_frame  = 1;
 			mask                      = Aeron_MouseButtonMask(event->button.button);
 			g_aeron.input.mouse.raw_x = (int)event->button.x;
 			g_aeron.input.mouse.raw_y = (int)event->button.y;

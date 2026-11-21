@@ -3,11 +3,14 @@ cbuffer OverlayVS : register(b0, space1) {
 	row_major float4x4 model_to_world;
 	float4             params; /* x = view-space depth bias */
 	uint               mesh_table_index;
-	uint3              _pad;
+	uint               _pad0;
+	uint               _pad1;
+	uint               _pad2;
 };
 #include "mesh_table_layout.hlsli"
-StructuredBuffer<float4> mesh_tables : register(t0, space0);
-static const uint MESH_TABLE_STRIDE = AERON_MESH_TABLE_STRIDE_VEC4;
+/* Mesh table as a 2D RGBA32F texture (width = stride, height = table
+ * count), read with texelFetch — no vertex storage buffer (GLES). */
+Texture2D<float4> mesh_tables : register(t0, space0);
 static const uint MESH_VISIBILITY_OFFSET = AERON_MESH_VISIBILITY_OFFSET;
 struct VSIn {
 	float3 pos : POSITION;
@@ -22,16 +25,16 @@ VSOut main(VSIn input) {
 	VSOut output;
 	int   mesh_index = clamp((int)round(input.mesh_index), 0,
 							 AERON_MAX_MESH_SLOTS - 1);
-	uint table_base = mesh_table_index * MESH_TABLE_STRIDE;
-	if (mesh_tables[table_base + MESH_VISIBILITY_OFFSET +
-					((uint)mesh_index >> 2u)][(uint)mesh_index & 3u] < 0.5f) {
+	uint table_index = mesh_table_index;
+	if (mesh_tables.Load(int3(MESH_VISIBILITY_OFFSET +
+					((uint)mesh_index >> 2u), table_index, 0))[(uint)mesh_index & 3u] < 0.5f) {
 		output.pos = float4(0, 0, 0, -1);
 		output.uv  = input.uv;
 		return output;
 	}
-	float4 rotation_row_0 = mesh_tables[table_base + (uint)mesh_index * 3u + 0u];
-	float4 rotation_row_1 = mesh_tables[table_base + (uint)mesh_index * 3u + 1u];
-	float4 rotation_row_2 = mesh_tables[table_base + (uint)mesh_index * 3u + 2u];
+	float4 rotation_row_0 = mesh_tables.Load(int3((uint)mesh_index * 3u + 0u, table_index, 0));
+	float4 rotation_row_1 = mesh_tables.Load(int3((uint)mesh_index * 3u + 1u, table_index, 0));
+	float4 rotation_row_2 = mesh_tables.Load(int3((uint)mesh_index * 3u + 2u, table_index, 0));
 	float3 articulated_position =
 		float3(dot(rotation_row_0.xyz, input.pos) + rotation_row_0.w,
 			   dot(rotation_row_1.xyz, input.pos) + rotation_row_1.w,
