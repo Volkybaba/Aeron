@@ -565,6 +565,31 @@ int Aeron_VideoSubmit(AeronVideoPlayer* player, const AeronVideoPresentDesc* des
 	return player->render_submission != 0;
 }
 
+int Aeron_VideoCopyCurrentFrame(AeronVideoPlayer* player, uint8_t* out_pixels, size_t capacity,
+                                int* out_width, int* out_height) {
+	int width, height;
+	size_t needed;
+	if (!player || !out_pixels || !out_width || !out_height)
+		return 0;
+	SDL_LockMutex(player->lock);
+	if (!player->current_valid || !player->current_pixels) {
+		SDL_UnlockMutex(player->lock);
+		return 0;
+	}
+	width = player->info.width;
+	height = player->info.height;
+	needed = (size_t)width * (size_t)height * 4u;
+	if (width <= 0 || height <= 0 || needed > capacity) {
+		SDL_UnlockMutex(player->lock);
+		return 0;
+	}
+	memcpy(out_pixels, player->current_pixels, needed);
+	SDL_UnlockMutex(player->lock);
+	*out_width = width;
+	*out_height = height;
+	return 1;
+}
+
 AeronVideoState Aeron_VideoGetState(const AeronVideoPlayer* player) {
 	AeronVideoState state;
 	if (!player) {

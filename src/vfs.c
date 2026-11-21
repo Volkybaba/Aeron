@@ -643,6 +643,12 @@ int AeronVfs_Open(AeronVfs* vfs, AeronVfsRoot root, const char* path, AeronVfsOp
 		}
 	}
 	if (!file->stream) {
+		if (path && strstr(path, "strings.txt")) {
+			Aeron_LogError("xvt.files",
+				       "DIAG strings.txt open failed: root='%s' host='%s' sdlerr='%s'",
+				       Aeron_VfsRootPath(vfs, root) ? Aeron_VfsRootPath(vfs, root) : "(null)",
+				       host_path, SDL_GetError());
+		}
 		SDL_free(file);
 		return 0;
 	}

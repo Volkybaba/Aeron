@@ -107,6 +107,11 @@ uint64_t        Aeron_VideoGetPresentedFrameIndex(const AeronVideoPlayer* player
 /* Returns whether a wake is scheduled and writes its delay from the current frame start. */
 int         Aeron_VideoGetNextWakeDelayUs(const AeronVideoPlayer* player, uint64_t* out_delay_us);
 int         Aeron_VideoGetInfo(const AeronVideoPlayer* player, AeronVideoInfo* out_info);
+/* Copies the current decoded frame (RGBA8888, pitch = width*4) into
+   out_pixels (must hold width*height*4 bytes) and writes its size.
+   Returns 1 when a frame was copied, 0 when none is ready. */
+int Aeron_VideoCopyCurrentFrame(AeronVideoPlayer* player, uint8_t* out_pixels, size_t capacity,
+                                int* out_width, int* out_height);
 int         Aeron_VideoGetStats(const AeronVideoPlayer* player, AeronVideoStats* out_stats);
 const char* Aeron_VideoGetError(const AeronVideoPlayer* player);
 
