@@ -3,10 +3,12 @@
 
 #include "aeron/aeron.h"
 #include "aeron/render.h"
+#include "aeron/scene/present.h"
 #include "aeron/surface.h"
 
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* DirectDraw -> Aeron compatibility shim.
  *
@@ -118,6 +120,48 @@ void AeronDx5_SetClassicFlightRenderingSuppressed(int suppressed) {
 }
 
 int AeronDx5_IsClassicFlightRenderingSuppressed(void) { return g_ddClassicFlightRenderingSuppressed; }
+
+static int DDShim_ReadbackRenderTarget(DDrawSurfaceShim* s);
+
+int AeronDx5_ReadbackPresentedFlightFrame(void* dst, int pitch, int* width, int* height, AeronPixelFormat* format) {
+	DDrawSurfaceShim* s = g_ddLastPresented;
+	int had_staging;
+	int cpu_pitch = 0;
+	void* pixels;
+	int y;
+
+	if (!dst || pitch <= 0 || !width || !height || !format)
+		return 0;
+	if (!s || !s->rt || s->kind != DDSHIM_RENDER_TARGET)
+		return 0;
+	if (g_ddClassicFlightRenderingSuppressed)
+		return 0;
+	if (s->format != AERON_PIXEL_FORMAT_RGB565 && s->format != AERON_PIXEL_FORMAT_RGB555)
+		return 0;
+	if (s->width <= 0 || s->height <= 0 || pitch < s->width * 2)
+		return 0;
+	/* ReadbackRenderTarget skips the copy when nothing is dirty; a staging
+	 * surface that was never populated would then read back blank. */
+	had_staging = s->cpu != NULL;
+	if (!s->gpu_dirty && !had_staging)
+		return 0;
+	if (!DDShim_ReadbackRenderTarget(s))
+		return 0;
+	if (!s->cpu)
+		return 0;
+	pixels = AeronSurface_Lock(s->cpu, &cpu_pitch);
+	if (!pixels || cpu_pitch < s->width * 2)
+		return 0;
+	for (y = 0; y < s->height; ++y)
+		memcpy((uint8_t*)dst + (size_t)pitch * (size_t)y,
+		       (const uint8_t*)pixels + (size_t)cpu_pitch * (size_t)y,
+		       (size_t)s->width * 2);
+	AeronSurface_Unlock(s->cpu);
+	*width = s->width;
+	*height = s->height;
+	*format = s->format;
+	return 1;
+}
 
 static AeronRectI DDShim_ClassicPresentationRect(const DDrawSurfaceShim* frame) {
 	return AeronDx5_PresentationRect(frame ? frame->width : 0, frame ? frame->height : 0);
@@ -248,8 +292,122 @@ static void DDShim_Present(DDrawSurfaceShim* frame, DDShimPresentKind kind) {
 	g_ddLastPresented = frame;
 }
 
+/* VolkyTFColl v13: brightness diagnostic logging (tie.brightness).
+ * Rate-limited: log on brightness change, otherwise at most once
+ * every 600 calls (~10 s at 60 fps) — no per-frame spam. The first
+ * call always logs (last_b starts at -1), so the log shows at once
+ * whether this path runs at all and which branch it takes. */
+static float s_ddshim_brightness_log_last_b = -1.0f;
+static int s_ddshim_brightness_log_tick = 0;
+
+static void DDShim_LogBrightness(const char* where, float b, int tint) {
+	++s_ddshim_brightness_log_tick;
+	if (b != s_ddshim_brightness_log_last_b || (s_ddshim_brightness_log_tick % 600) == 0) {
+		s_ddshim_brightness_log_last_b = b;
+		Aeron_LogInfo("tie.brightness", "%s b=%.2f tint=%d", where, (double)b, tint);
+	}
+}
+
+/* VolkyTFColl v14: CPU-side brightness for the retained CPU presentation.
+ * The GPU fragment-uniform tint (v11/v12) is ignored by this device's
+ * fullscreen composition pipeline (Mali G52 / Vulkan / SDL GPU): the tint
+ * is submitted, copied and pushed, the compiled shader multiplies by it,
+ * yet the screen never changes (v13 log: DX5 submit branch=retained
+ * b=2.00 tint=1 every frame, no effect). So apply the brightness on
+ * the CPU while expanding the INDEX8+palette frame to RGBA8888 — the
+ * exact math of the on-screen tint (sRGB decode -> linear -> gamma
+ * lift -> sRGB encode, byte-identical to screenshot.c's
+ * Screenshot_BrightenedPaletteByte). VolkyTFColl v15: the v14 linear
+ * factor barely lifted the shadows (sRGB 16 -> x2.0 -> ~26), so the
+ * factor is a gamma lift now: out_linear = powf(in_linear, 1.0f / b).
+ * Palette entries are used directly
+ * as 8-bit values (Aeron_ConvertIndexed8PixelFrameToRgba8 does the same;
+ * no extra <<2). Single application: layer.tint_enabled stays 0.
+ * b == 1.0 takes the old path with no copy (zero performance impact). */
+static uint8_t* s_ddBrightenedScratch       = NULL;
+static size_t   s_ddBrightenedScratchBytes  = 0;
+static uint32_t s_ddBrightenedScratchSerial = 0;
+
+static float DDShim_Srgb8ToLinear(uint8_t value) {
+	float srgb = (float)value / 255.0f;
+	return srgb <= 0.04045f ? srgb / 12.92f : powf((srgb + 0.055f) / 1.055f, 2.4f);
+}
+
+static uint8_t DDShim_LinearToSrgb8(float value) {
+	float srgb;
+	if (!(value > 0.0f))
+		return 0;
+	if (value > 1.0f)
+		value = 1.0f;
+	srgb = value <= 0.0031308f ? 12.92f * value : 1.055f * powf(value, 1.0f / 2.4f) - 0.055f;
+	if (srgb < 0.0f)
+		srgb = 0.0f;
+	if (srgb > 1.0f)
+		srgb = 1.0f;
+	return (uint8_t)(srgb * 255.0f + 0.5f);
+}
+
+/* VolkyTFColl v15: gamma lift instead of the v14 linear factor. A linear
+ * multiply barely lifts the shadows (sRGB 16 -> x2.0 -> ~26), while
+ * out_linear = powf(in_linear, 1.0f / b) raises them visibly (b=2.0:
+ * 16 -> ~76, 80 -> ~146) and keeps the highlights (200 -> ~226).
+ * b=1.0 is the identity; b=0.5 darkens consistently (80 -> ~19).
+ * Same curve as Screenshot_BrightenedPaletteByte and the HD flight
+ * capture path in screenshot.c. */
+static float DDShim_ApplyBrightnessGamma(float linear, float brightness) {
+	if (brightness == 1.0f || !(linear > 0.0f))
+		return linear;
+	return powf(linear, 1.0f / brightness);
+}
+
+/* Expand an INDEX8+palette view into the scratch RGBA8888 buffer with the
+ * brightness factor applied per channel in linear space. Returns 1 and
+ * fills *out on success; 0 leaves *out untouched (caller keeps the old
+ * path). The scratch is reused across frames; generation bumps every
+ * submit so the upload cache never holds a stale frame (it keys on
+ * generation + pixels address). */
+static int DDShim_BrightenRetainedView(const AeronPixelFrameView* view, float brightness,
+				       AeronPixelFrameView* out) {
+	size_t bytes;
+	int    y;
+
+	if (!view || !view->pixels || !view->palette || view->width <= 0 || view->height <= 0)
+		return 0;
+	bytes = (size_t)view->width * (size_t)view->height * 4u;
+	if (!s_ddBrightenedScratch || s_ddBrightenedScratchBytes < bytes) {
+		uint8_t* replacement = (uint8_t*)realloc(s_ddBrightenedScratch, bytes);
+		if (!replacement)
+			return 0;
+		s_ddBrightenedScratch      = replacement;
+		s_ddBrightenedScratchBytes = bytes;
+	}
+	for (y = 0; y < view->height; ++y) {
+		const uint8_t* src_row = (const uint8_t*)view->pixels + (size_t)y * (size_t)view->pitch;
+		uint8_t*       dst_row = s_ddBrightenedScratch + (size_t)y * (size_t)view->width * 4u;
+		int            x;
+		for (x = 0; x < view->width; ++x) {
+			const AeronPaletteEntry* entry = &view->palette[src_row[x]];
+			uint8_t*               out_px = dst_row + (size_t)x * 4u;
+			out_px[0] = DDShim_LinearToSrgb8(DDShim_ApplyBrightnessGamma(DDShim_Srgb8ToLinear(entry->r), brightness));
+			out_px[1] = DDShim_LinearToSrgb8(DDShim_ApplyBrightnessGamma(DDShim_Srgb8ToLinear(entry->g), brightness));
+			out_px[2] = DDShim_LinearToSrgb8(DDShim_ApplyBrightnessGamma(DDShim_Srgb8ToLinear(entry->b), brightness));
+			out_px[3] = entry->a;
+		}
+	}
+	*out            = *view;
+	out->pixels     = s_ddBrightenedScratch;
+	out->pitch      = view->width * 4;
+	out->bpp        = 32;
+	out->format     = AERON_PIXEL_FORMAT_RGBA8888;
+	out->palette    = NULL;
+	out->generation = ++s_ddBrightenedScratchSerial;
+	return 1;
+}
+
 static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame) {
 	if (!frame) {
+		/* VolkyTFColl v13: diagnostic — nothing presented at all. */
+		DDShim_LogBrightness("DX5 submit branch=none", AeronScenePresent_Brightness(), 0);
 		return;
 	}
 	if (frame->rt) {
@@ -263,6 +421,27 @@ static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame) {
 		tex.logical_rect = DDShim_ClassicPresentationRect(frame);
 		tex.blend_mode   = AERON_LAYER_BLEND_OPAQUE;
 		tex.color_space  = AERON_COLOR_SPACE_SRGB;
+		/* VolkyTFColl v12: user brightness. The classic pixel layer
+		 * (v11) never presents TIE98 scenes — the briefing room, menus
+		 * and classic flight all come through this DX5 texture layer
+		 * (EndFrame) — so the tint must live here too. Same linear
+		 * factor as the flight tonemap exposure (u[4]); 100% = identity.
+		 * No double application: HD flight suppresses this path
+		 * (EndFrame returns early) and takes brightness from u[4]
+		 * instead; the classic pixel layer is never submitted for a
+		 * DX5-presented frame. */
+		{
+			const float brightness = AeronScenePresent_Brightness();
+			if (brightness != 1.0f) {
+				tex.tint_enabled = 1;
+				tex.tint_rgba[0] = brightness;
+				tex.tint_rgba[1] = brightness;
+				tex.tint_rgba[2] = brightness;
+				tex.tint_rgba[3] = 1.0f;
+			}
+			/* VolkyTFColl v13: diagnostic — which branch, live b, tint. */
+			DDShim_LogBrightness("DX5 submit branch=rt", brightness, tex.tint_enabled);
+		}
 		if (tex.texture) {
 			if (!Aeron_SubmitTextureLayer(&tex)) {
 				Aeron_RequestFatalRendererError("retained classic texture presentation");
@@ -273,6 +452,8 @@ static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame) {
 	if (g_ddRetainedCpuPresentation) {
 		AeronPixelFrameView view;
 		AeronPixelLayerDesc layer;
+		const float         brightness = AeronScenePresent_Brightness();
+		int                 cpu_brightened = 0;
 		if (!AeronSurface_GetFrameView(g_ddRetainedCpuPresentation, &view)) {
 			return;
 		}
@@ -281,6 +462,28 @@ static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame) {
 		layer.logical_rect = DDShim_ClassicPresentationRect(frame);
 		layer.blend_mode   = AERON_LAYER_BLEND_OPAQUE;
 		layer.sampling     = AERON_PIXEL_SAMPLING_SHARP_BILINEAR;
+		/* VolkyTFColl v14: CPU-side brightness (DDShim_BrightenRetainedView).
+		 * The v12 GPU tint is kept only as a fallback for non-INDEX8
+		 * retained frames (or a scratch allocation failure); for
+		 * INDEX8+palette frames the brightness is baked into the scratch
+		 * pixels and tint stays off — single application, no double
+		 * multiply. */
+		if (brightness != 1.0f && view.format == AERON_PIXEL_FORMAT_INDEX8 && view.palette) {
+			AeronPixelFrameView bright;
+			if (DDShim_BrightenRetainedView(&view, brightness, &bright)) {
+				layer.frame    = bright;
+				cpu_brightened = 1;
+			}
+		}
+		if (!cpu_brightened && brightness != 1.0f) {
+			layer.tint_enabled = 1;
+			layer.tint_rgba[0] = brightness;
+			layer.tint_rgba[1] = brightness;
+			layer.tint_rgba[2] = brightness;
+			layer.tint_rgba[3] = 1.0f;
+		}
+		/* VolkyTFColl v13: diagnostic — which branch, live b, tint. */
+		DDShim_LogBrightness("DX5 submit branch=retained", brightness, layer.tint_enabled);
 		if (!Aeron_SubmitPixelLayer(&layer)) {
 			Aeron_RequestFatalRendererError("retained classic software-surface presentation");
 		}
@@ -290,6 +493,19 @@ static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame) {
 void AeronDx5_ForceSubmitRetainedFrame(void) { DDShim_SubmitLastPresented(g_ddLastPresented); }
 
 void AeronDx5_EndFrame(void) {
+	/* VolkyTFColl v13: diagnostic heartbeat — which presentation path
+	 * runs (suppression / retained frame present / pending present).
+	 * VolkyTFColl v14: separate counter. v13 shared the submit log's
+	 * tick: EndFrame and the submit log each bumped it once per frame,
+	 * so EndFrame always saw an odd tick and tick % 600 == 0 (600 even)
+	 * could never fire — the heartbeat was dead code. */
+	static int s_ddshim_endframe_log_tick = 0;
+	if (++s_ddshim_endframe_log_tick >= 600) {
+		s_ddshim_endframe_log_tick = 0;
+		Aeron_LogInfo("tie.brightness", "Dx5 EndFrame suppressed=%d has_frame=%d pending=%d",
+			(int)g_ddClassicFlightRenderingSuppressed, (int)(g_ddLastPresented != NULL),
+			(int)g_ddSuppressedPresentPending);
+	}
 	if (g_ddClassicFlightRenderingSuppressed)
 		return;
 	/* TIE can enter a classic in-flight room inside the engine tick. The new
@@ -318,6 +534,10 @@ void AeronDx5_ResetPresentationState(void) {
 void DDShim_ReleasePresentationResources(void) {
 	AeronSurface_Destroy(g_ddRetainedCpuPresentation);
 	g_ddRetainedCpuPresentation = NULL;
+	/* VolkyTFColl v14: free the CPU-brightness scratch. */
+	free(s_ddBrightenedScratch);
+	s_ddBrightenedScratch      = NULL;
+	s_ddBrightenedScratchBytes = 0;
 }
 
 /* Composite a source CPU surface onto a render surface's render target. The render

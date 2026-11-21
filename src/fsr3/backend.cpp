@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <new> /* VolkyTFColl v1: std::nothrow needs <new> (same upstream bug as OpenXvT/OpenXW) */
 
 namespace {
 

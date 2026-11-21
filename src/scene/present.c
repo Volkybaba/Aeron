@@ -120,6 +120,24 @@ void AeronScenePresent_SetAcesExposure(float v) {
 	s_aces_exposure = v;
 }
 
+/* VolkyTFColl v11: user brightness (scene exposure, present u[4]). */
+static float s_brightness = 1.0f;
+
+float AeronScenePresent_Brightness(void) { return s_brightness; }
+
+void AeronScenePresent_SetBrightness(float v) {
+	if (!(v > 0.0f)) {
+		v = 1.0f;
+	}
+	if (v < 0.5f) {
+		v = 0.5f;
+	}
+	if (v > 2.0f) {
+		v = 2.0f;
+	}
+	s_brightness = v;
+}
+
 void AeronScenePresent_ApplySettings(const AeronSceneTonemapSettings* settings) {
 	if (!settings) {
 		return;
@@ -241,7 +259,7 @@ void AeronScenePresentChain_Draw(AeronScenePresentChain* c, AeronRenderPass* pas
 		rt_w > 0 ? 2.0f * bloom_scale / (float)rt_w : 0.0f,
 		rt_h > 0 ? 2.0f / AERON_SCENE_BLOOM_REFERENCE_HEIGHT : 0.0f,
 		bar_y_uv,
-		1.0f, /* scene exposure */
+		AeronScenePresent_Brightness(), /* scene exposure (v11 user brightness) */
 		(float)AeronScenePresent_TonemapOp(),
 		hdr_peak_scale,
 		Aeron_RenderPassOutputRgbScale(pass),

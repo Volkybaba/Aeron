@@ -54,6 +54,14 @@ void  AeronScenePresent_SetEotfExponent(float v);
 float AeronScenePresent_AcesExposure(void);
 void  AeronScenePresent_SetAcesExposure(float v);
 
+/* VolkyTFColl v11: user brightness, clamped to [0.5, 2.0]; default 1.0.
+ * Applied as the scene exposure (u[4]) in the present chain: the tonemap
+ * shader multiplies (scene + bloom) by it in linear space BEFORE the
+ * operator, so it brightens/darkens without re-encoding. The classic
+ * pixel layer reads the same value live for its composition tint. */
+float AeronScenePresent_Brightness(void);
+void  AeronScenePresent_SetBrightness(float v);
+
 /* Apply a complete validated renderer configuration. Individual setters
  * remain available for interactive debug tools. */
 void AeronScenePresent_ApplySettings(const AeronSceneTonemapSettings* settings);
