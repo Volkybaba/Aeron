@@ -13,7 +13,9 @@ cbuffer MbFsrTileMaxUniforms : register(b0, space2)
     uint2 render_size;
     uint2 output_size;
     uint tile_size;
-    uint3 _pad;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
 };
 
 groupshared float2 s_velocity[MB_GROUP_THREADS];

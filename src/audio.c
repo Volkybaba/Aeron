@@ -453,6 +453,17 @@ static void Aeron_AudioMixStream(AeronAudioStreamSlot* stream, int frames) {
 	stream->submitted_frames += stream->read_position - old_position;
 	if (mixed < frames) {
 		++stream->underruns;
+		/* VolkyTFColl v16 (devam): teshis — ring bosaliyor mu? 1. ve
+		 * her 200. underrun'da logla (SDL callback thread'inden;
+		 * Aeron_LogWarn SDL_Log uzerinden thread-safe). Underrun
+		 * sayisi artiyorsa uretici (tie-pcm worker) yetisemiyor
+		 * demektir; 0 kaliyorsa kesiklik baska yoldadir (DirectSound
+		 * voice / film .WAV refill). */
+		if (stream->underruns == 1 || (stream->underruns % 200) == 0) {
+			Aeron_LogWarn("aeron.audio", "stream underrun: rate=%d ch=%d total=%llu",
+						  stream->rate, stream->channels,
+						  (unsigned long long)stream->underruns);
+		}
 	}
 	if ((uint64_t)floor(stream->read_position) > (uint64_t)floor(old_position)) {
 		SDL_BroadcastCondition(g_audio.stream_space_available);

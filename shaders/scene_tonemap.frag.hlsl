@@ -72,7 +72,7 @@ cbuffer TonemapPS : register(b0, space3)
      *   x = look (0 = base, 1 = punchy)
      *   y = punchy power
      *   z = punchy saturation
-     *   w = reserved. */
+     *   w = gamma exponent (1/b, pushed by host u[19]). */
     float4 agx_params;
 };
 
@@ -166,7 +166,13 @@ float4 main(VSOut input) : SV_Target
      * exactly one path per frame — no per-pixel divergence, no
      * measurable perf delta vs hard-coding one operator. Both branches
      * return linear display-referred values. */
-    float3 rgb = (scene + bloom_contrib) * tonemap_params.x;
+    /* VolkyTFColl v19: user brightness as a gamma lift, not a linear
+     * exposure — same curve as the classic palette path
+     * (DDShim_ApplyBrightnessGamma) and the HD screenshot path
+     * (screenshot.c). Linear x3 barely lifts the shadows once AgX
+     * + EOTF 2.2 compress them; pow(x, 1/b) does. agx_params.w
+     * carries 1/b from the host (present.c u[19]); b == 1 is identity. */
+    float3 rgb = pow(max(scene + bloom_contrib, 0.0f), agx_params.w);
     /* Match the host enum: 0 = ACES Fitted, 1 = AGX parametric.
      * Branch is uniform across the quad. ACES gets a pre-exposure
      * boost (present_misc.z) to lift its dark toe up to AgX's. */

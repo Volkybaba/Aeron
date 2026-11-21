@@ -325,6 +325,18 @@ FSOut main(PbrForwardVSOut i, bool is_front : SV_IsFrontFace)
     if (xvt_flat == 0.0f && isolate == 0 &&
         i.base_color_emissive_strength > 0.0f) {
         lit = albedo * i.base_color_emissive_strength;
+        /* VolkyTFColl: a projectile whose sampled albedo is (near-)black
+         * — e.g. its UVs land on an empty atlas region — stays invisible
+         * against space despite the emissive override. Fall back to the
+         * material emissive colour, then to white, so the bolt is always
+         * visible. No-op when the albedo is a real bolt colour. */
+        float bolt_lum = dot(lit, float3(0.299f, 0.587f, 0.114f));
+        if (bolt_lum < 0.05f) {
+            lit = m.emissive_packed.rgb * i.base_color_emissive_strength;
+            bolt_lum = dot(lit, float3(0.299f, 0.587f, 0.114f));
+            if (bolt_lum < 0.05f)
+                lit = float3(1.0f, 1.0f, 1.0f) * i.base_color_emissive_strength;
+        }
     } else if (xvt_flat == 0.0f) {
         float3 emissive = m.emissive_packed.rgb;
         float emissive_coverage = 0.0f;

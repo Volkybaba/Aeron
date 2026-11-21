@@ -478,11 +478,11 @@ static int shadow_ensure_resources(struct AeronScene3D* scene, uint32_t atlas_si
 	if (!scene->shadow_tried) {
 		scene->shadow_tried   = 1;
 		scene->shadow_vs      = AeronSceneInternal_CompileShader("scene_directional_shadow.vert",
-																 AERON_SHADER_STAGE_VERTEX, 0, 1, 1);
+																 AERON_SHADER_STAGE_VERTEX, 1, 1, 0);
 		scene->shadow_fs      = AeronSceneInternal_CompileShader("scene_directional_shadow.frag",
 																 AERON_SHADER_STAGE_FRAGMENT, 0, 0, 0);
 		scene->shadow_mask_vs = AeronSceneInternal_CompileShader("scene_directional_shadow_mask.vert",
-																 AERON_SHADER_STAGE_VERTEX, 0, 1, 1);
+																 AERON_SHADER_STAGE_VERTEX, 1, 1, 0);
 		scene->shadow_mask_fs = AeronSceneInternal_CompileShader("scene_directional_shadow_mask.frag",
 																 AERON_SHADER_STAGE_FRAGMENT, 1, 0, 2);
 	}
@@ -1121,7 +1121,8 @@ static void shadow_draw_class(struct AeronScene3D* scene, AeronRenderPass* pass,
 
 static void shadow_draw_list(struct AeronScene3D* scene, AeronRenderPass* pass, const float view_proj[16],
 							 const uint16_t* casters, uint16_t caster_count, uint32_t* triangle_count) {
-	Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_VERTEX, 0, scene->mesh_table_buffer);
+	Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_VERTEX, 0, scene->mesh_table_texture,
+							 scene->mesh_table_sampler);
 	shadow_draw_class(scene, pass, view_proj, casters, caster_count, 0, triangle_count);
 	shadow_draw_class(scene, pass, view_proj, casters, caster_count, 1, triangle_count);
 }

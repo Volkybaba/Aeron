@@ -351,6 +351,11 @@ int AeronScenePost_EnsureMb(struct AeronScene3D* s) {
 		.thread_count_y                  = 8,
 		.thread_count_z                  = 1,
 	});
+	if (!s->mb_tilemax_compute_pipeline) {
+		/* No compute support (e.g. GLES backend): high-quality motion blur
+		   needs the TileMax compute pass; fall back to low-quality blur. */
+		s->post.mb_quality = 1;
+	}
 	s->mb_reconstruct_ps =
 		AeronSceneInternal_CompileShader("scene_mb_reconstruct.frag", AERON_SHADER_STAGE_FRAGMENT, 4, 1, 0);
 	s->mb_neighbormax_ps =

@@ -105,6 +105,7 @@ void AeronSceneClusteredLights_Classify(AeronScene3D* s) {
 	s->cluster_global_count = 0;
 	s->cluster_light_count  = 0;
 	s->cluster_active =
+		s->cluster_build_pipeline &&
 		s->cluster_desc.enabled &&
 		(s->cluster_desc.debug_view || s->point_light_count > AERON_SCENE_CLUSTER_BRUTE_FORCE_MAX_LIGHTS);
 	memset(s->cluster_global_indices, 0, sizeof s->cluster_global_indices);
@@ -198,9 +199,13 @@ int AeronSceneClusteredLights_Ensure(AeronScene3D* s) {
 			.thread_count_z                 = 1,
 		});
 	}
+	if (!s->cluster_build_pipeline) {
+		/* No compute support (e.g. GLES backend): clustered lighting is
+		   unavailable; fall back to non-clustered (brute-force) lighting. */
+		s->cluster_active = 0;
+	}
 	const uint32_t output_usage = AERON_BUFFER_USAGE_STORAGE | AERON_BUFFER_USAGE_COMPUTE_STORAGE_WRITE;
-	return s->cluster_build_pipeline &&
-		   cluster_ensure_buffer(&s->cluster_header_buffer, &s->cluster_header_buffer_cap,
+	return cluster_ensure_buffer(&s->cluster_header_buffer, &s->cluster_header_buffer_cap,
 								 (uint32_t)sizeof(AeronSceneClusterHeaderGPU), output_usage,
 								 "scene.cluster_headers") &&
 		   cluster_ensure_buffer(&s->cluster_index_buffer, &s->cluster_index_buffer_cap,
@@ -211,6 +216,12 @@ int AeronSceneClusteredLights_Ensure(AeronScene3D* s) {
 int AeronSceneClusteredLights_Build(AeronScene3D* s, AeronCommandBuffer* cmd) {
 	if (!s || !cmd || !AeronSceneClusteredLights_Ensure(s)) {
 		return 0;
+	}
+	if (!s->cluster_build_pipeline) {
+		/* No compute support: clustering unavailable, skip the build. */
+		s->cluster_active = 0;
+		s->cluster_ready  = 1;
+		return 1;
 	}
 	cluster_prepare_uniform(s);
 	const uint64_t cluster_count =

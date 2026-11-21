@@ -15,8 +15,9 @@ cbuffer DirectionalShadowVS : register(b0, space1)
 
 #include "mesh_table_layout.hlsli"
 
-StructuredBuffer<float4> mesh_tables : register(t0, space0);
-static const uint MESH_TABLE_STRIDE = AERON_MESH_TABLE_STRIDE_VEC4;
+/* Mesh table as a 2D RGBA32F texture (width = stride, height = table
+ * count), read with texelFetch — no vertex storage buffer (GLES). */
+Texture2D<float4> mesh_tables : register(t0, space0);
 static const uint MESH_VISIBILITY_OFFSET = AERON_MESH_VISIBILITY_OFFSET;
 
 bool directional_shadow_project_vertex(float3 position, float mesh_index_value,
@@ -24,16 +25,15 @@ bool directional_shadow_project_vertex(float3 position, float mesh_index_value,
 {
     int mesh_index = clamp((int)round(mesh_index_value), 0,
                            AERON_MAX_MESH_SLOTS - 1);
-    uint table_base = mesh_table_index * MESH_TABLE_STRIDE;
-    if (mesh_tables[table_base + MESH_VISIBILITY_OFFSET +
-                    ((uint)mesh_index >> 2u)][(uint)mesh_index & 3u] < 0.5f) {
+    if (mesh_tables.Load(int3(MESH_VISIBILITY_OFFSET +
+                    ((uint)mesh_index >> 2u), mesh_table_index, 0))[(uint)mesh_index & 3u] < 0.5f) {
         projected_position = float4(0.0f, 0.0f, 0.0f, -1.0f);
         return false;
     }
 
-    float4 r0 = mesh_tables[table_base + (uint)mesh_index * 3u + 0u];
-    float4 r1 = mesh_tables[table_base + (uint)mesh_index * 3u + 1u];
-    float4 r2 = mesh_tables[table_base + (uint)mesh_index * 3u + 2u];
+    float4 r0 = mesh_tables.Load(int3((uint)mesh_index * 3u + 0u, mesh_table_index, 0));
+    float4 r1 = mesh_tables.Load(int3((uint)mesh_index * 3u + 1u, mesh_table_index, 0));
+    float4 r2 = mesh_tables.Load(int3((uint)mesh_index * 3u + 2u, mesh_table_index, 0));
     float3 articulated = float3(
         dot(r0.xyz, position) + r0.w,
         dot(r1.xyz, position) + r1.w,

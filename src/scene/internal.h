@@ -271,10 +271,11 @@ struct AeronScene3D {
 	uint32_t                   point_light_staging_cap;
 	AeronSceneClusterLightGPU* cluster_light_staging;
 	uint32_t                   cluster_light_staging_cap;
-	AeronBuffer*               mesh_table_buffer;
-	uint32_t                   mesh_table_buffer_cap;
-	AeronBuffer*               local_light_buffer;
-	uint32_t                   local_light_buffer_cap;
+	AeronTexture*              mesh_table_texture;
+	uint32_t                   mesh_table_texture_h;
+	AeronTexture*              local_light_texture;
+	uint32_t                   local_light_texture_h;
+	AeronSampler*              mesh_table_sampler;
 	AeronBuffer*               point_light_buffer;
 	uint32_t                   point_light_buffer_cap;
 	AeronBuffer*               cluster_light_buffer;

@@ -63,7 +63,17 @@ int Aeron_WindowInit(const AeronConfig* config) {
 	 * Aeron mouse/window math stays in points; only Aeron_Present's
 	 * swapchain-measured presentation rect sees pixels. */
 	g_aeron.window =
-		SDL_CreateWindow(title, width, height, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+		SDL_CreateWindow(title, width, height,
+				 SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_VULKAN |
+					 SDL_WINDOW_FULLSCREEN); /* VolkyTFColl v1: KMSDRM needs VULKAN, else EGL fallback fails (OpenXW v2 lesson) */
+	if (!g_aeron.window) {
+		/* No Vulkan-capable window (e.g. SDL2-backend shim on GLES):
+		   the SDL GPU API does not need SDL_WINDOW_VULKAN, retry without it. */
+		Aeron_LogWarn("aeron", "SDL_CreateWindow with SDL_WINDOW_VULKAN failed: %s; retrying without it", SDL_GetError());
+		g_aeron.window =
+			SDL_CreateWindow(title, width, height,
+					 SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_FULLSCREEN);
+	}
 	if (!g_aeron.window) {
 		Aeron_LogError("aeron", "SDL_CreateWindow failed: %s", SDL_GetError());
 		return 0;

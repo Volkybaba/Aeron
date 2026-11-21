@@ -2,6 +2,7 @@
 #define AERON_COMPAT_HOST_H
 
 #include "aeron/compat/ddraw.h"
+#include "aeron/render.h"
 #include "aeron/vfs.h"
 
 #ifdef __cplusplus
@@ -39,6 +40,13 @@ void AeronDx5_ResetPresentationState(void);
  * surfaces; CPU DirectDraw surfaces used by frontends continue normally. */
 void AeronDx5_SetClassicFlightRenderingSuppressed(int suppressed);
 int  AeronDx5_IsClassicFlightRenderingSuppressed(void);
+
+/* Reads back the last presented classic flight frame (the DX5 render-target
+ * surface) into a caller-owned RGB565/RGB555 buffer. Returns 0 when there is
+ * no presented GPU surface, the format is not 16-bit, or classic flight
+ * rendering is suppressed (the staging may be stale); the caller then falls
+ * back to the classic framebuffer path. */
+int AeronDx5_ReadbackPresentedFlightFrame(void* dst, int pitch, int* width, int* height, AeronPixelFormat* format);
 
 /* Forces submission of the final retained classic frame, including while normal
  * classic presentation is suppressed. Does not advance the flip chain. */

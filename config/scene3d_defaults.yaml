@@ -35,7 +35,7 @@ shadows:
 
 tonemap:
   operator: agx
-  agx_look: punchy
+  agx_look: base
   agx_eotf_exponent: 2.2
   agx_punchy_power: 1.1
   agx_punchy_saturation: 1.3

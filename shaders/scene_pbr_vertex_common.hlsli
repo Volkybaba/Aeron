@@ -37,16 +37,19 @@ cbuffer GltfMeshVSUniforms : register(b0, space1) {
 };
 
 /* One AERON_MESH_TABLE_STRIDE_VEC4-float4 record per unique submitted
- * mesh table; layout shared with AeronSceneMeshTable. */
+ * mesh table; layout shared with AeronSceneMeshTable. The table is a
+ * 2D RGBA32F texture (width = stride, height = table count) read with
+ * texelFetch: vertex stages on GLES allow zero storage blocks, so the
+ * lookup table rides a texture instead of a storage buffer. */
 #include "mesh_table_layout.hlsli"
-StructuredBuffer<float4> mesh_tables : register(t0, space0);
+Texture2D<float4> mesh_tables : register(t0, space0);
 static const uint MESH_TABLE_STRIDE = AERON_MESH_TABLE_STRIDE_VEC4;
 static const uint MESH_VISIBILITY_OFFSET = AERON_MESH_VISIBILITY_OFFSET;
 static const uint MESH_EMISSIVE_OFFSET = AERON_MESH_EMISSIVE_OFFSET;
 
 float4 mesh_table_load(uint table_index, uint offset)
 {
-	return mesh_tables[table_index * MESH_TABLE_STRIDE + offset];
+	return mesh_tables.Load(int3(offset, table_index, 0));
 }
 
 struct VSIn {
@@ -87,6 +90,25 @@ bool pbr_build_current_vertex(VSIn input, out PbrCurrentVertex current)
 {
 	uint mesh_index = (uint)clamp((int)round(input.mesh_index), 0,
 								  AERON_MAX_MESH_SLOTS - 1);
+	/* DIAG v37: mesh-table texture bypass for the identity table
+	 * (table index 0). Projectiles use the identity table; if the GPU
+	 * texture row 0 is wrong the VS degenerates every bolt vertex
+	 * (visibility < 0.5 -> raster (0,0,0,-1)). Hardcoded identity is
+	 * exactly what the texture must contain, so a correct texture is
+	 * unaffected. Temporary test only. */
+	if (current_table_index == 0u) {
+		current.mesh_index = mesh_index;
+		current.row0 = float4(1.0f, 0.0f, 0.0f, 0.0f);
+		current.row1 = float4(0.0f, 1.0f, 0.0f, 0.0f);
+		current.row2 = float4(0.0f, 0.0f, 1.0f, 0.0f);
+		current.rotated_local = input.position;
+		precise float4 world_position =
+			mul(craft_to_world, float4(current.rotated_local, 1.0f));
+		precise float4 raster_position = mul(view_proj, world_position);
+		current.world_position = world_position;
+		current.raster_position = raster_position;
+		return true;
+	}
 	float visibility =
 		mesh_table_load(current_table_index,
 						MESH_VISIBILITY_OFFSET + (mesh_index >> 2u))[mesh_index & 3u];
@@ -123,13 +145,18 @@ void pbr_build_velocity(VSIn input, PbrCurrentVertex current,
 						out float4 clip_curr, out float4 clip_prev)
 {
 	uint mesh_index = current.mesh_index;
-	float4 row0 = mesh_table_load(previous_table_index, mesh_index * 3u + 0u);
-	float4 row1 = mesh_table_load(previous_table_index, mesh_index * 3u + 1u);
-	float4 row2 = mesh_table_load(previous_table_index, mesh_index * 3u + 2u);
+	/* DIAG v37: same identity bypass as pbr_build_current_vertex. */
 	float3 previous_local;
-	previous_local.x = dot(row0.xyz, input.position) + row0.w;
-	previous_local.y = dot(row1.xyz, input.position) + row1.w;
-	previous_local.z = dot(row2.xyz, input.position) + row2.w;
+	if (previous_table_index == 0u) {
+		previous_local = input.position;
+	} else {
+		float4 row0 = mesh_table_load(previous_table_index, mesh_index * 3u + 0u);
+		float4 row1 = mesh_table_load(previous_table_index, mesh_index * 3u + 1u);
+		float4 row2 = mesh_table_load(previous_table_index, mesh_index * 3u + 2u);
+		previous_local.x = dot(row0.xyz, input.position) + row0.w;
+		previous_local.y = dot(row1.xyz, input.position) + row1.w;
+		previous_local.z = dot(row2.xyz, input.position) + row2.w;
+	}
 
 	clip_curr = camera_mb != 0u
 		? mul(unjittered_view_proj, current.world_position)

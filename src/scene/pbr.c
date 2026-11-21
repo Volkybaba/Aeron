@@ -320,10 +320,10 @@ int AeronScenePbr_Ensure(struct AeronScene3D* s) {
 	}
 	s->pbr_tried = 1;
 
-	s->pbr_vs               = pbr_shader("scene_pbr_mesh.vert", AERON_SHADER_STAGE_VERTEX, 0, 1, 2);
-	s->pbr_prepass_vs       = pbr_shader("scene_pbr_prepass.vert", AERON_SHADER_STAGE_VERTEX, 0, 1, 1);
-	s->pbr_prepass_mask_vs  = pbr_shader("scene_pbr_prepass_mask.vert", AERON_SHADER_STAGE_VERTEX, 0, 1, 1);
-	s->pbr_prepass_stamp_vs = pbr_shader("scene_pbr_prepass_stamp.vert", AERON_SHADER_STAGE_VERTEX, 0, 1, 1);
+	s->pbr_vs               = pbr_shader("scene_pbr_mesh.vert", AERON_SHADER_STAGE_VERTEX, 2, 1, 0);
+	s->pbr_prepass_vs       = pbr_shader("scene_pbr_prepass.vert", AERON_SHADER_STAGE_VERTEX, 1, 1, 0);
+	s->pbr_prepass_mask_vs  = pbr_shader("scene_pbr_prepass_mask.vert", AERON_SHADER_STAGE_VERTEX, 1, 1, 0);
+	s->pbr_prepass_stamp_vs = pbr_shader("scene_pbr_prepass_stamp.vert", AERON_SHADER_STAGE_VERTEX, 1, 1, 0);
 	s->pbr_fs               = pbr_shader("scene_pbr_mesh.frag", AERON_SHADER_STAGE_FRAGMENT, 8, 3, 5);
 	s->pbr_mask_fs          = pbr_shader("scene_pbr_mesh_mask.frag", AERON_SHADER_STAGE_FRAGMENT, 8, 3, 5);
 	s->pbr_prepass_fs       = pbr_shader("scene_pbr_prepass.frag", AERON_SHADER_STAGE_FRAGMENT, 0, 0, 0);
@@ -517,9 +517,11 @@ int AeronScenePbr_DrawInstances(struct AeronScene3D* s, AeronCommandBuffer* cmd,
 	}
 	AeronCullMode bound_cull = AERON_CULL_NONE;
 	Aeron_BindGraphicsPipeline(pass, pipeline);
-	Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_VERTEX, 0, s->mesh_table_buffer);
+	Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_VERTEX, 0, s->mesh_table_texture,
+							 s->mesh_table_sampler);
 	if (!depth_only) {
-		Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_VERTEX, 1, s->local_light_buffer);
+		Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_VERTEX, 1, s->local_light_texture,
+								 s->mesh_table_sampler);
 	}
 	/* AO input at t4 (pbr FS declares it unconditionally); a white 1x1
 	 * placeholder keeps AO reading as 1 when SSAO is off. Prepass FS
@@ -535,6 +537,11 @@ int AeronScenePbr_DrawInstances(struct AeronScene3D* s, AeronCommandBuffer* cmd,
 
 	const AeronSceneMesh* bound_mesh                  = NULL;
 	int                   bound_receiver_local_shadow = 0;
+	/* VolkyTFColl v32 DIAG (temporary): draw-skip probe for projectiles. */
+	static uint32_t s_laser_draw_count = 0;
+	/* VolkyTFColl v36 SWAP (temporary): swap-test duty-cycle counters. */
+	static uint32_t s_laser_swap_count = 0;
+	static uint32_t s_ship_swap_count = 0;
 	for (int i = 0; i < s->instance_count; ++i) {
 		const AeronSceneMeshInstance* in = &s->instances[i];
 		const AeronSceneMesh*         m  = in->mesh;
@@ -552,7 +559,31 @@ int AeronScenePbr_DrawInstances(struct AeronScene3D* s, AeronCommandBuffer* cmd,
 
 		/* Per-instance cull variant — rebind only on change (resource
 		 * bindings persist across pipeline binds within the pass). */
-		const AeronCullMode cull = (AeronCullMode)in->cull_mode;
+		AeronCullMode cull = (AeronCullMode)in->cull_mode;
+		/* VolkyTFColl v36 SWAP (temporary): pipeline/mesh swap test,
+		 * forward pass only, 50% duty cycle. TEST 1: projectile drawn
+		 * with the ship's BACK pipeline variant (ships with
+		 * single-sided materials use BACK; projectiles are forced
+		 * NONE). TEST 2: a large opaque mesh (ship) drawn with the
+		 * projectile's NONE variant — its normal draw IS the swap
+		 * draw, so if the NONE variant is broken the ship blinks.
+		 * swap_proj/swap_ship carry the decision to the post-draw
+		 * block below. */
+		int swap_proj = 0;
+		int swap_ship = 0;
+		if (!depth_only && pipe_kind == AERON_PBR_PIPE_FORWARD) {
+			if (in->base_color_emissive_strength > 0.0f) {
+				if (((++s_laser_swap_count) % 60u) < 30u) {
+					cull = AERON_CULL_BACK;
+					swap_proj = 1;
+				}
+			} else if (m->opaque_index_count >= 1000) {
+				if (((++s_ship_swap_count) % 60u) < 30u) {
+					cull = AERON_CULL_NONE;
+					swap_ship = 1;
+				}
+			}
+		}
 		if (cull != bound_cull) {
 			AeronGraphicsPipeline* p = pbr_draw_pipeline(s, pipe_kind, cull);
 			if (!p) {
@@ -580,8 +611,244 @@ int AeronScenePbr_DrawInstances(struct AeronScene3D* s, AeronCommandBuffer* cmd,
 		pbr_push_instance_uniforms(s, pass, in, m, &s->prepared_instances[i], velocity, depth_only,
 								   screen_shadow);
 
+		/* VolkyTFColl v32 DIAG (temporary): log projectile draws. There is
+		 * NO frustum cull in this path (verified by code reading), so
+		 * culled is always 0; drawn=1 means Aeron_DrawIndexed is issued
+		 * for this instance. pos = instance world position (transform
+		 * translation), boundr = mesh bound_radius. Projectile = emissive
+		 * strength > 0 (same marker as the v26 magenta override). */
+		if (in->base_color_emissive_strength > 0.0f) {
+			if ((++s_laser_draw_count % 30u) == 0u) {
+				Aeron_LogInfo("tie.flight",
+					      "DIAG laser draw pipe=%d depthonly=%d opaque=%u cull=%d drawn=1 "
+					      "pos=(%.1f,%.1f,%.1f) boundr=%.2f",
+					      pipe_kind, depth_only, (unsigned)m->opaque_index_count,
+					      (int)in->cull_mode, in->transform[3], in->transform[7],
+					      in->transform[11], m->bound_radius);
+				/* VolkyTFColl v33 DIAG (temporary): replicate the VS transform
+				 * on CPU with the exact data the VS reads (mesh-table
+				 * articulation + visibility, C2W, jittered view_proj). The
+				 * v31 NDC DIAG ignores the mesh table; the VS does not — if
+				 * visibility is 0 the VS degenerates the vertex (w=-1) and
+				 * nothing rasterizes. */
+				{
+					const AeronSceneMeshTable* tbl =
+						in->mesh_table ? in->mesh_table : AeronScenePbr_IdentityTable();
+					const char* tbl_src = in->mesh_table ? "custom" : "identity";
+					uint32_t vis_bad = 0, vis_total = 0;
+					int slot0 = -1;
+					float vis0 = -1.0f;
+					float r0x[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+					float r1x[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+					float r2x[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+					float njx = 0.0f, njy = 0.0f, njz = 0.0f, wj = 0.0f;
+					float nux = 0.0f, nuy = 0.0f, nuz = 0.0f, wu = 0.0f;
+					int osj = 0, osu = 0;
+					if (m->cpu_vertices && m->cpu_indices && m->opaque_index_count >= 3) {
+						for (uint32_t vi = 0; vi < m->opaque_index_count; ++vi) {
+							const uint16_t idx = m->cpu_indices[vi];
+							int sl = (int)(m->cpu_vertices[idx].mesh_index + 0.5f);
+							if (sl < 0)
+								sl = 0;
+							if (sl >= AERON_MAX_MESH_SLOTS)
+								sl = AERON_MAX_MESH_SLOTS - 1;
+							float vis = tbl->visibility_packed[sl >> 2][sl & 3];
+							vis_total++;
+							if (vis < 0.5f)
+								vis_bad++;
+						}
+						const uint16_t idx0 = m->cpu_indices[0];
+						const float* p0 = m->cpu_vertices[idx0].pos;
+						slot0 = (int)(m->cpu_vertices[idx0].mesh_index + 0.5f);
+						if (slot0 < 0)
+							slot0 = 0;
+						if (slot0 >= AERON_MAX_MESH_SLOTS)
+							slot0 = AERON_MAX_MESH_SLOTS - 1;
+						vis0 = tbl->visibility_packed[slot0 >> 2][slot0 & 3];
+						memcpy(r0x, tbl->rows[slot0][0], sizeof r0x);
+						memcpy(r1x, tbl->rows[slot0][1], sizeof r1x);
+						memcpy(r2x, tbl->rows[slot0][2], sizeof r2x);
+						float rl[3];
+						rl[0] = r0x[0] * p0[0] + r0x[1] * p0[1] + r0x[2] * p0[2] + r0x[3];
+						rl[1] = r1x[0] * p0[0] + r1x[1] * p0[1] + r1x[2] * p0[2] + r1x[3];
+						rl[2] = r2x[0] * p0[0] + r2x[1] * p0[1] + r2x[2] * p0[2] + r2x[3];
+						const float* T = in->transform;
+						float wx = T[0] * rl[0] + T[1] * rl[1] + T[2] * rl[2] + T[3];
+						float wy = T[4] * rl[0] + T[5] * rl[1] + T[6] * rl[2] + T[7];
+						float wz = T[8] * rl[0] + T[9] * rl[1] + T[10] * rl[2] + T[11];
+						const float* VJ = s->jittered_view_proj;
+						float cx = VJ[0] * wx + VJ[1] * wy + VJ[2] * wz + VJ[3];
+						float cy = VJ[4] * wx + VJ[5] * wy + VJ[6] * wz + VJ[7];
+						float cz = VJ[8] * wx + VJ[9] * wy + VJ[10] * wz + VJ[11];
+						float cw = VJ[12] * wx + VJ[13] * wy + VJ[14] * wz + VJ[15];
+						wj = cw;
+						njx = (cw != 0.0f) ? cx / cw : 0.0f;
+						njy = (cw != 0.0f) ? cy / cw : 0.0f;
+						njz = (cw != 0.0f) ? cz / cw : 0.0f;
+						osj = (cw > 0.0f && njx >= -1.0f && njx <= 1.0f && njy >= -1.0f &&
+						       njy <= 1.0f)
+							      ? 1
+							      : 0;
+						const float* VU = s->unjittered_view_proj;
+						float ux = VU[0] * wx + VU[1] * wy + VU[2] * wz + VU[3];
+						float uy = VU[4] * wx + VU[5] * wy + VU[6] * wz + VU[7];
+						float uz = VU[8] * wx + VU[9] * wy + VU[10] * wz + VU[11];
+						float uw = VU[12] * wx + VU[13] * wy + VU[14] * wz + VU[15];
+						wu = uw;
+						nux = (uw != 0.0f) ? ux / uw : 0.0f;
+						nuy = (uw != 0.0f) ? uy / uw : 0.0f;
+						nuz = (uw != 0.0f) ? uz / uw : 0.0f;
+						osu = (uw > 0.0f && nux >= -1.0f && nux <= 1.0f && nuy >= -1.0f &&
+						       nuy <= 1.0f)
+							      ? 1
+							      : 0;
+					}
+					Aeron_LogInfo("tie.flight",
+					      "DIAG laser vs table=%s tidx=%u slot=%d vis=%.2f visbad=%u/%u "
+					      "row0=(%.2f,%.2f,%.2f,%.2f) row1=(%.2f,%.2f,%.2f,%.2f) "
+					      "row2=(%.2f,%.2f,%.2f,%.2f)",
+					      tbl_src, (unsigned)s->prepared_instances[i].current_table_index,
+					      slot0, vis0, (unsigned)vis_bad, (unsigned)vis_total,
+					      r0x[0], r0x[1], r0x[2], r0x[3],
+					      r1x[0], r1x[1], r1x[2], r1x[3],
+					      r2x[0], r2x[1], r2x[2], r2x[3]);
+					Aeron_LogInfo("tie.flight",
+					      "DIAG laser vsclip jit ndc=%.3f,%.3f,%.3f w=%.3f os=%d "
+					      "unjit ndc=%.3f,%.3f,%.3f w=%.3f os=%d",
+					      njx, njy, njz, wj, osj, nux, nuy, nuz, wu, osu);
+					/* VolkyTFColl v34 DIAG (temporary): GPU vertex-buffer
+					 * contents. The VBO is uploaded from model->vertices
+					 * and cpu_vertices is a copy of the same source; log
+					 * the first 3 opaque vertices (pos + mesh_index) and
+					 * the index values + stride so a GPU-side mismatch
+					 * (wrong stride/offset/stale data) shows up. */
+					if (m->cpu_vertices && m->cpu_indices && m->opaque_index_count >= 3) {
+						const uint16_t bi0 = m->cpu_indices[0];
+						const uint16_t bi1 = m->cpu_indices[1];
+						const uint16_t bi2 = m->cpu_indices[2];
+						Aeron_LogInfo("tie.flight",
+						      "DIAG laser vbuf v0=(%.2f,%.2f,%.2f) mi0=%.1f "
+						      "v1=(%.2f,%.2f,%.2f) mi1=%.1f "
+						      "v2=(%.2f,%.2f,%.2f) mi2=%.1f idx=%u,%u,%u "
+						      "stride=%u opaq=%u vbo=%d ibo=%d",
+						      m->cpu_vertices[bi0].pos[0], m->cpu_vertices[bi0].pos[1],
+						      m->cpu_vertices[bi0].pos[2], m->cpu_vertices[bi0].mesh_index,
+						      m->cpu_vertices[bi1].pos[0], m->cpu_vertices[bi1].pos[1],
+						      m->cpu_vertices[bi1].pos[2], m->cpu_vertices[bi1].mesh_index,
+						      m->cpu_vertices[bi2].pos[0], m->cpu_vertices[bi2].pos[1],
+						      m->cpu_vertices[bi2].pos[2], m->cpu_vertices[bi2].mesh_index,
+						      (unsigned)bi0, (unsigned)bi1, (unsigned)bi2,
+						      (unsigned)sizeof(AeronGltfVertex),
+						      (unsigned)m->opaque_index_count,
+						      m->vbo ? 1 : 0, m->ibo ? 1 : 0);
+					}
+				}
+			}
+			/* VolkyTFColl v34 DIAG (temporary): viewport / render target
+			 * at draw time. The forward pass renders to the scene color
+			 * RT at render resolution; log it plus the sample count
+			 * (sample_count==1 means the forward depth compare is EQUAL
+			 * against the prepass depth, otherwise GREATER_EQUAL). */
+			Aeron_LogInfo("tie.flight",
+			      "DIAG laser vp camvp=(%d,%d,%dx%d) outvp=(%d,%d,%dx%d) "
+			      "out=%dx%d render=%dx%d msaa=%d",
+			      s->camera.viewport.x, s->camera.viewport.y,
+			      s->camera.viewport.width, s->camera.viewport.height,
+			      s->output_camera.viewport.x, s->output_camera.viewport.y,
+			      s->output_camera.viewport.width, s->output_camera.viewport.height,
+			      s->output_w, s->output_h, s->render_w, s->render_h,
+			      (int)s->sample_count);
+		}
+
 		/* Opaque range only. Mask and blend ranges use their own sweeps. */
 		Aeron_DrawIndexed(pass, m->opaque_index_count, 0, 0);
+
+		/* VolkyTFColl v36 SWAP (temporary): post-draw part. TEST 1:
+		 * the projectile's normal draw above already used the ship's
+		 * BACK variant; redraw it once more with the C2W's first
+		 * column negated (mirrors the ribbon, flips its winding), so
+		 * one of the two draws is front-facing under BACK culling —
+		 * if the BACK pipeline works at all, a bolt appears on swap
+		 * frames. The mirrored ribbon covers the same region (the
+		 * ribbon is symmetric in width), so its depth still matches
+		 * the prepass (EQUAL passes). TEST 2: the ship's normal draw
+		 * above already used NONE — just log it. */
+		if (swap_proj) {
+			AeronSceneMeshInstance mir_in = *in;
+			for (int k = 0; k < 3; ++k) {
+				mir_in.transform[k * 4 + 0] *= -1.0f;
+				mir_in.prev_transform[k * 4 + 0] *= -1.0f;
+			}
+			pbr_push_instance_uniforms(s, pass, &mir_in, m, &s->prepared_instances[i],
+						   velocity, depth_only, screen_shadow);
+			Aeron_DrawIndexed(pass, m->opaque_index_count, 0, 0);
+		}
+		if (swap_proj || swap_ship) {
+			Aeron_LogInfo("tie.flight",
+				      "DIAG laser swap drawn=1 which=%s cull=%d opaq=%u "
+				      "pos=(%.1f,%.1f,%.1f) boundr=%.2f",
+				      swap_proj ? "proj-back" : "ship-none", swap_proj ? 2 : 0,
+				      (unsigned)m->opaque_index_count, in->transform[3], in->transform[7],
+				      in->transform[11], m->bound_radius);
+		}
+
+		/* VolkyTFColl v35 DIAG (temporary): hello triangle + depth-off
+		 * laser. Fires on the same cadence as the draw DIAG (every 30th
+		 * projectile draw), forward pass only (color). The hello triangle
+		 * reuses this projectile's mesh/VBO/IBO/pipeline but scales the
+		 * C2W 3x3 by HELLO_SCALE so the ~1-unit ribbon becomes a huge
+		 * on-screen triangle: if it appears, the PBR draw path +
+		 * rasterization work and the laser is laser-specific; if not,
+		 * the path itself is broken. The depth-off laser redraws the
+		 * same bolt with depth testing disabled (ALWAYS, no write): if
+		 * it appears while the normal bolt does not, depth/occlusion
+		 * (cockpit) is hiding the bolt. They alternate (hello on %30==0,
+		 * nodepth on %30==15) so they never cover each other. */
+		static AeronGraphicsPipeline* s_laser_nodepth_pipe = NULL;
+		static int s_laser_nodepth_pipe_kind = -1;
+		static AeronSampleCount s_laser_nodepth_sample_count = 0;
+		if (!depth_only && in->base_color_emissive_strength > 0.0f) {
+			if ((s_laser_draw_count % 30u) == 0u) {
+				AeronSceneMeshInstance hello_in = *in;
+				const float hs = 10000.0f;
+				for (int k = 0; k < 3; ++k) {
+					hello_in.transform[k * 4 + 0] *= hs;
+					hello_in.transform[k * 4 + 1] *= hs;
+					hello_in.transform[k * 4 + 2] *= hs;
+					hello_in.prev_transform[k * 4 + 0] *= hs;
+					hello_in.prev_transform[k * 4 + 1] *= hs;
+					hello_in.prev_transform[k * 4 + 2] *= hs;
+				}
+				pbr_push_instance_uniforms(s, pass, &hello_in, m, &s->prepared_instances[i],
+							   velocity, depth_only, screen_shadow);
+				Aeron_DrawIndexed(pass, m->opaque_index_count, 0, 0);
+				Aeron_LogInfo("tie.flight",
+					      "DIAG laser hello drawn=1 scale=%.0f pos=(%.1f,%.1f,%.1f)",
+					      (double)hs, in->transform[3], in->transform[7], in->transform[11]);
+			} else if ((s_laser_draw_count % 30u) == 15u) {
+				if (!s_laser_nodepth_pipe || s_laser_nodepth_pipe_kind != pipe_kind ||
+				    s_laser_nodepth_sample_count != s->sample_count) {
+					const PbrTargetDesc color_rw = { s->color_format, 0xF };
+					s_laser_nodepth_pipe = pbr_pipeline(
+						s->pbr_vs, pbr_color_shader(s, pipe_kind, 0), &color_rw, 1,
+						0 /* depth_test off */, 0 /* depth_write off */,
+						AERON_COMPARE_ALWAYS, AERON_CULL_NONE, 0 /* blend */,
+						s->sample_count);
+					s_laser_nodepth_pipe_kind = pipe_kind;
+					s_laser_nodepth_sample_count = s->sample_count;
+				}
+				if (s_laser_nodepth_pipe) {
+					Aeron_BindGraphicsPipeline(pass, s_laser_nodepth_pipe);
+					pbr_push_instance_uniforms(s, pass, in, m, &s->prepared_instances[i],
+								   velocity, depth_only, screen_shadow);
+					Aeron_DrawIndexed(pass, m->opaque_index_count, 0, 0);
+					Aeron_BindGraphicsPipeline(pass, pipeline);
+					Aeron_LogInfo("tie.flight",
+						      "DIAG laser nodepth drawn=1 pos=(%.1f,%.1f,%.1f)",
+						      in->transform[3], in->transform[7], in->transform[11]);
+				}
+			}
+		}
 	}
 
 	/* Masked geometry is opaque after its material cutoff, but requires base
@@ -684,8 +951,10 @@ int AeronScenePbr_DrawTransparentInstances(struct AeronScene3D* s, AeronRenderPa
 	if (s->instance_count == 0) {
 		return 1;
 	}
-	Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_VERTEX, 0, s->mesh_table_buffer);
-	Aeron_BindStorageBuffer(pass, AERON_SHADER_STAGE_VERTEX, 1, s->local_light_buffer);
+	Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_VERTEX, 0, s->mesh_table_texture,
+							 s->mesh_table_sampler);
+	Aeron_BindTextureSampler(pass, AERON_SHADER_STAGE_VERTEX, 1, s->local_light_texture,
+							 s->mesh_table_sampler);
 	/* Screen-space AO belongs to the nearest opaque/masked depth layer, not
 	 * this later transparent layer. Bind white while preserving the already
 	 * shaded background's AO. */

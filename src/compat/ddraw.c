@@ -3,10 +3,12 @@
 
 #include "aeron/aeron.h"
 #include "aeron/render.h"
+#include "aeron/scene/present.h"
 #include "aeron/surface.h"
 
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* DirectDraw -> Aeron compatibility shim.
  *
@@ -118,6 +120,48 @@ void AeronDx5_SetClassicFlightRenderingSuppressed(int suppressed) {
 }
 
 int AeronDx5_IsClassicFlightRenderingSuppressed(void) { return g_ddClassicFlightRenderingSuppressed; }
+
+static int DDShim_ReadbackRenderTarget(DDrawSurfaceShim* s);
+
+int AeronDx5_ReadbackPresentedFlightFrame(void* dst, int pitch, int* width, int* height, AeronPixelFormat* format) {
+	DDrawSurfaceShim* s = g_ddLastPresented;
+	int had_staging;
+	int cpu_pitch = 0;
+	void* pixels;
+	int y;
+
+	if (!dst || pitch <= 0 || !width || !height || !format)
+		return 0;
+	if (!s || !s->rt || s->kind != DDSHIM_RENDER_TARGET)
+		return 0;
+	if (g_ddClassicFlightRenderingSuppressed)
+		return 0;
+	if (s->format != AERON_PIXEL_FORMAT_RGB565 && s->format != AERON_PIXEL_FORMAT_RGB555)
+		return 0;
+	if (s->width <= 0 || s->height <= 0 || pitch < s->width * 2)
+		return 0;
+	/* ReadbackRenderTarget skips the copy when nothing is dirty; a staging
+	 * surface that was never populated would then read back blank. */
+	had_staging = s->cpu != NULL;
+	if (!s->gpu_dirty && !had_staging)
+		return 0;
+	if (!DDShim_ReadbackRenderTarget(s))
+		return 0;
+	if (!s->cpu)
+		return 0;
+	pixels = AeronSurface_Lock(s->cpu, &cpu_pitch);
+	if (!pixels || cpu_pitch < s->width * 2)
+		return 0;
+	for (y = 0; y < s->height; ++y)
+		memcpy((uint8_t*)dst + (size_t)pitch * (size_t)y,
+		       (const uint8_t*)pixels + (size_t)cpu_pitch * (size_t)y,
+		       (size_t)s->width * 2);
+	AeronSurface_Unlock(s->cpu);
+	*width = s->width;
+	*height = s->height;
+	*format = s->format;
+	return 1;
+}
 
 static AeronRectI DDShim_ClassicPresentationRect(const DDrawSurfaceShim* frame) {
 	return AeronDx5_PresentationRect(frame ? frame->width : 0, frame ? frame->height : 0);
@@ -248,8 +292,166 @@ static void DDShim_Present(DDrawSurfaceShim* frame, DDShimPresentKind kind) {
 	g_ddLastPresented = frame;
 }
 
-static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame) {
+/* VolkyTFColl v13: brightness diagnostic logging (tie.brightness).
+ * Rate-limited: log on brightness change, otherwise at most once
+ * every 600 calls (~10 s at 60 fps) — no per-frame spam. The first
+ * call always logs (last_b starts at -1), so the log shows at once
+ * whether this path runs at all and which branch it takes. */
+static float s_ddshim_brightness_log_last_b = -1.0f;
+static int s_ddshim_brightness_log_tick = 0;
+
+static void DDShim_LogBrightness(const char* where, float b, int tint) {
+	++s_ddshim_brightness_log_tick;
+	if (b != s_ddshim_brightness_log_last_b || (s_ddshim_brightness_log_tick % 600) == 0) {
+		s_ddshim_brightness_log_last_b = b;
+		Aeron_LogInfo("tie.brightness", "%s b=%.2f tint=%d", where, (double)b, tint);
+	}
+}
+
+/* VolkyTFColl v14: CPU-side brightness for the retained CPU presentation.
+ * The GPU fragment-uniform tint (v11/v12) is ignored by this device's
+ * fullscreen composition pipeline (Mali G52 / Vulkan / SDL GPU): the tint
+ * is submitted, copied and pushed, the compiled shader multiplies by it,
+ * yet the screen never changes (v13 log: DX5 submit branch=retained
+ * b=2.00 tint=1 every frame, no effect). So apply the brightness on
+ * the CPU — the exact math of the on-screen tint (sRGB decode -> linear
+ * -> gamma lift -> sRGB encode, byte-identical to screenshot.c's
+ * Screenshot_BrightenedPaletteByte). VolkyTFColl v15: the v14 linear
+ * factor barely lifted the shadows (sRGB 16 -> x2.0 -> ~26), so the
+ * factor is a gamma lift now: out_linear = powf(in_linear, 1.0f / b).
+ * Palette entries are used directly
+ * as 8-bit values (Aeron_ConvertIndexed8PixelFrameToRgba8 does the same;
+ * no extra <<2). Single application: layer.tint_enabled stays 0.
+ * b == 1.0 takes the old path with no copy (zero performance impact).
+ * VolkyTFColl v16: the v14/v15 per-pixel brighten ran 9 powf() per pixel
+ * per EndFrame (576k powf at 320x200, ~8-16 ms — half the 60 Hz frame
+ * budget) and bumped the generation every submit, so the upload cache
+ * never held a frame. Brightness now applies to the PALETTE instead:
+ * 256 entries brightened once when the palette or brightness changes,
+ * the per-pixel lookup (Aeron_ConvertIndexed8PixelFrameToRgba8) then
+ * reads the brightened palette. Bit-identical output: the convert step
+ * copies palette entries verbatim, so brightening the entry and looking
+ * it up yields exactly the bytes the per-pixel loop wrote. */
+static AeronPaletteEntry s_ddBrightenedPalette[256];
+static AeronPaletteEntry s_ddBrightenedPaletteSource[256];
+static float             s_ddBrightenedPaletteBrightness = 0.0f;
+static uint32_t          s_ddBrightenedPaletteSerial     = 0;
+static int               s_ddBrightenedPaletteValid      = 0;
+
+/* Upload-cache generation for the retained layer (render_backend.c keys on
+ * generation + pixels address; the slot persists across frames). The
+ * surface generation already bumps on every content/palette mutation
+ * (blit/clear/lock-unlock/SetPalette), but a brightness change touches
+ * neither — so hand the layer a monotonic generation that changes exactly
+ * when the presented image changes. Repeat frames (film at 20-24 fps vs
+ * 60 Hz EndFrame) then skip the re-upload. */
+static uint32_t s_ddBrightSubmitGeneration      = 0;
+static uint32_t s_ddBrightLastSurfaceGeneration = 0;
+static uint32_t s_ddBrightLastPaletteSerial     = 0;
+static int      s_ddBrightLastBrightened        = -1;
+
+/* VolkyTFColl v16 (devam) Fix 2: son submit edilen retained goruntu
+ * (generation + logical rect). Ayni goruntu tekrar submit edilmez;
+ * Aeron_Present render_layer_count==0 gorup keep-last-frame yolundan
+ * doner. ResetPresentationState / ReleasePresentationResources ve
+ * frame==NULL dali bunu sifirlar (0 gecerli bir generation degildir). */
+static uint32_t   s_ddLastSubmittedGeneration = 0;
+static AeronRectI s_ddLastSubmittedRect       = { 0, 0, 0, 0 };
+
+static float DDShim_Srgb8ToLinear(uint8_t value) {
+	float srgb = (float)value / 255.0f;
+	return srgb <= 0.04045f ? srgb / 12.92f : powf((srgb + 0.055f) / 1.055f, 2.4f);
+}
+
+static uint8_t DDShim_LinearToSrgb8(float value) {
+	float srgb;
+	if (!(value > 0.0f))
+		return 0;
+	if (value > 1.0f)
+		value = 1.0f;
+	srgb = value <= 0.0031308f ? 12.92f * value : 1.055f * powf(value, 1.0f / 2.4f) - 0.055f;
+	if (srgb < 0.0f)
+		srgb = 0.0f;
+	if (srgb > 1.0f)
+		srgb = 1.0f;
+	return (uint8_t)(srgb * 255.0f + 0.5f);
+}
+
+/* VolkyTFColl v15: gamma lift instead of the v14 linear factor. A linear
+ * multiply barely lifts the shadows (sRGB 16 -> x2.0 -> ~26), while
+ * out_linear = powf(in_linear, 1.0f / b) raises them visibly (b=2.0:
+ * 16 -> ~76, 80 -> ~146) and keeps the highlights (200 -> ~226).
+ * b=1.0 is the identity; b=0.5 darkens consistently (80 -> ~19).
+ * Same curve as Screenshot_BrightenedPaletteByte and the HD flight
+ * capture path in screenshot.c. */
+static float DDShim_ApplyBrightnessGamma(float linear, float brightness) {
+	if (brightness == 1.0f || !(linear > 0.0f))
+		return linear;
+	/* VolkyTFColl v20: highlight-preserving gamma. Pure pow pushes
+	 * mid/high tones toward white (briefing washed out at b=5).
+	 * Blend back toward the source as the value rises, so shadows
+	 * lift fully while highlights keep their contrast. */
+	float g = powf(linear, 1.0f / brightness);
+	float w = (1.0f - linear) * (1.0f - linear);
+	return linear + (g - linear) * w;
+}
+
+/* Brighten the 256-entry palette once (256 x 9 powf) and hand back the
+ * brightened copy; the per-pixel lookup then reads it directly. Recomputes
+ * only when the source palette or the brightness changed. Returns 1 on
+ * success; 0 leaves *out_palette untouched (caller keeps the tint
+ * fallback). The source palette is copied, never mutated in place — the
+ * retained surface keeps its original palette for the next frame. */
+static int DDShim_BrightenRetainedPalette(const AeronPaletteEntry* palette, float brightness,
+					  const AeronPaletteEntry** out_palette) {
+	int i;
+
+	if (!palette || !out_palette)
+		return 0;
+	if (!s_ddBrightenedPaletteValid || brightness != s_ddBrightenedPaletteBrightness ||
+		memcmp(palette, s_ddBrightenedPaletteSource, sizeof(s_ddBrightenedPaletteSource)) != 0) {
+		memcpy(s_ddBrightenedPaletteSource, palette, sizeof(s_ddBrightenedPaletteSource));
+		for (i = 0; i < 256; ++i) {
+			s_ddBrightenedPalette[i].r = DDShim_LinearToSrgb8(
+				DDShim_ApplyBrightnessGamma(DDShim_Srgb8ToLinear(palette[i].r), brightness));
+			s_ddBrightenedPalette[i].g = DDShim_LinearToSrgb8(
+				DDShim_ApplyBrightnessGamma(DDShim_Srgb8ToLinear(palette[i].g), brightness));
+			s_ddBrightenedPalette[i].b = DDShim_LinearToSrgb8(
+				DDShim_ApplyBrightnessGamma(DDShim_Srgb8ToLinear(palette[i].b), brightness));
+			s_ddBrightenedPalette[i].a = palette[i].a;
+		}
+		s_ddBrightenedPaletteBrightness = brightness;
+		s_ddBrightenedPaletteValid      = 1;
+		++s_ddBrightenedPaletteSerial;
+	}
+	*out_palette = s_ddBrightenedPalette;
+	return 1;
+}
+
+/* Monotonic upload-cache generation for the retained layer: changes exactly
+ * when the presented image changes (surface content/palette generation,
+ * brightened palette serial, or the brightened flag). The first call
+ * always changes (last values start at 0/-1) so the first frame uploads. */
+static uint32_t DDShim_RetainedSubmitGeneration(uint32_t surface_generation, int brightened) {
+	if (surface_generation != s_ddBrightLastSurfaceGeneration ||
+		s_ddBrightenedPaletteSerial != s_ddBrightLastPaletteSerial ||
+		brightened != s_ddBrightLastBrightened) {
+		s_ddBrightLastSurfaceGeneration = surface_generation;
+		s_ddBrightLastPaletteSerial     = s_ddBrightenedPaletteSerial;
+		s_ddBrightLastBrightened        = brightened;
+		++s_ddBrightSubmitGeneration;
+	}
+	return s_ddBrightSubmitGeneration;
+}
+
+static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame, int force) {
 	if (!frame) {
+		/* VolkyTFColl v16 (devam) Fix 2: sunulacak kare yokken son
+		 * submit kaydini sil — sonraki kare ayni generation ile
+		 * gelse bile atlanmasin. */
+		s_ddLastSubmittedGeneration = 0;
+		/* VolkyTFColl v13: diagnostic — nothing presented at all. */
+		DDShim_LogBrightness("DX5 submit branch=none", AeronScenePresent_Brightness(), 0);
 		return;
 	}
 	if (frame->rt) {
@@ -263,6 +465,47 @@ static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame) {
 		tex.logical_rect = DDShim_ClassicPresentationRect(frame);
 		tex.blend_mode   = AERON_LAYER_BLEND_OPAQUE;
 		tex.color_space  = AERON_COLOR_SPACE_SRGB;
+		/* VolkyTFColl v12/v20: user brightness. The classic pixel layer
+		 * (v11) never presents TIE98 scenes — the briefing room, menus
+		 * and classic flight all come through this DX5 texture layer
+		 * (EndFrame) — so the brightness must live here too.
+		 * v20: NOT a linear multiply. A linear tint of 5.0 clips every
+		 * mid tone to white (briefing washed out) while barely lifting
+		 * dark pixels (debriefing room stayed dark) — the two v19
+		 * symptoms are one wrong curve. Use lift+gain instead, via the
+		 * layer's tint (gain) + bias (lift): out = in*gain + lift.
+		 * b=5 -> gain 1.20, lift 0.10 (linear): dark 0.01 -> 0.11,
+		 * mid 0.20 -> 0.34, bright 0.60 -> 0.82 — shadows lift, nothing
+		 * clips. b=1 is identity. b<1 keeps the old linear dim.
+		 * No double application: HD flight suppresses this path
+		 * (EndFrame returns early) and takes brightness from u[4]
+		 * instead; the classic pixel layer is never submitted for a
+		 * DX5-presented frame. */
+		{
+			const float brightness = AeronScenePresent_Brightness();
+			if (brightness != 1.0f) {
+				tex.tint_enabled = 1;
+				if (brightness > 1.0f) {
+					const float gain = 1.0f + 0.05f * (brightness - 1.0f);
+					const float lift = 0.125f * (1.0f - 1.0f / brightness);
+					tex.tint_rgba[0] = gain;
+					tex.tint_rgba[1] = gain;
+					tex.tint_rgba[2] = gain;
+					tex.tint_rgba[3] = 1.0f;
+					tex.bias_rgba[0] = lift;
+					tex.bias_rgba[1] = lift;
+					tex.bias_rgba[2] = lift;
+					tex.bias_rgba[3] = 0.0f;
+				} else {
+					tex.tint_rgba[0] = brightness;
+					tex.tint_rgba[1] = brightness;
+					tex.tint_rgba[2] = brightness;
+					tex.tint_rgba[3] = 1.0f;
+				}
+			}
+			/* VolkyTFColl v13: diagnostic — which branch, live b, tint. */
+			DDShim_LogBrightness("DX5 submit branch=rt", brightness, tex.tint_enabled);
+		}
 		if (tex.texture) {
 			if (!Aeron_SubmitTextureLayer(&tex)) {
 				Aeron_RequestFatalRendererError("retained classic texture presentation");
@@ -273,6 +516,8 @@ static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame) {
 	if (g_ddRetainedCpuPresentation) {
 		AeronPixelFrameView view;
 		AeronPixelLayerDesc layer;
+		const float         brightness = AeronScenePresent_Brightness();
+		int                 cpu_brightened = 0;
 		if (!AeronSurface_GetFrameView(g_ddRetainedCpuPresentation, &view)) {
 			return;
 		}
@@ -281,15 +526,75 @@ static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame) {
 		layer.logical_rect = DDShim_ClassicPresentationRect(frame);
 		layer.blend_mode   = AERON_LAYER_BLEND_OPAQUE;
 		layer.sampling     = AERON_PIXEL_SAMPLING_SHARP_BILINEAR;
+		/* VolkyTFColl v16: palette brightness (was v14/v15 per-pixel
+		 * brighten). The v12 GPU tint is kept only as a fallback for
+		 * non-INDEX8 retained frames (or a palette-brighten failure);
+		 * for INDEX8+palette frames the brightness is baked into the
+		 * palette and tint stays off — single application, no double
+		 * multiply. */
+		if (brightness != 1.0f && view.format == AERON_PIXEL_FORMAT_INDEX8 && view.palette) {
+			const AeronPaletteEntry* bright_palette = NULL;
+			if (DDShim_BrightenRetainedPalette(view.palette, brightness, &bright_palette)) {
+				layer.frame.palette = bright_palette;
+				cpu_brightened      = 1;
+			}
+		}
+		/* Upload-cache generation: monotonic, changes only when the
+		 * presented image changes (see DDShim_RetainedSubmitGeneration).
+		 * Repeat frames skip the re-upload. */
+		layer.frame.generation = DDShim_RetainedSubmitGeneration(view.generation, cpu_brightened);
+		if (!cpu_brightened && brightness != 1.0f) {
+			layer.tint_enabled = 1;
+			layer.tint_rgba[0] = brightness;
+			layer.tint_rgba[1] = brightness;
+			layer.tint_rgba[2] = brightness;
+			layer.tint_rgba[3] = 1.0f;
+		}
+		/* VolkyTFColl v16 (devam) Fix 2: tekrar karede submit'i atla.
+		 * Film 20-24 fps, EndFrame 60 Hz — karelerin ~2/3'u tekrar.
+		 * Upload cache zaten tekrari atliyordu ama SubmitPixelLayer +
+		 * Aeron_Present (GPU kompozisyon + swapchain acquire) her
+		 * karede calisiyordu. Sunulan goruntu (generation + rect)
+		 * degismediyse layer'i hic submit etme: Aeron_Present
+		 * render_layer_count==0 gorup keep-last-frame yolundan doner,
+		 * ekran ayni kareyi tutar. Generation; surface generation,
+		 * palet serial ve brightened flag'ini kapsar (parlaklik
+		 * degisimi palet serial'i artirir), rect ise yerlesim
+		 * degisimini yakalar. Sadece retained dalinda; rt dali ve
+		 * force submit etkilenmez. */
+		if (!force && layer.frame.generation == s_ddLastSubmittedGeneration &&
+			layer.logical_rect.x == s_ddLastSubmittedRect.x &&
+			layer.logical_rect.y == s_ddLastSubmittedRect.y &&
+			layer.logical_rect.width == s_ddLastSubmittedRect.width &&
+			layer.logical_rect.height == s_ddLastSubmittedRect.height) {
+			return;
+		}
+		s_ddLastSubmittedGeneration = layer.frame.generation;
+		s_ddLastSubmittedRect       = layer.logical_rect;
+		/* VolkyTFColl v13: diagnostic — which branch, live b, tint. */
+		DDShim_LogBrightness("DX5 submit branch=retained", brightness, layer.tint_enabled);
 		if (!Aeron_SubmitPixelLayer(&layer)) {
 			Aeron_RequestFatalRendererError("retained classic software-surface presentation");
 		}
 	}
 }
 
-void AeronDx5_ForceSubmitRetainedFrame(void) { DDShim_SubmitLastPresented(g_ddLastPresented); }
+void AeronDx5_ForceSubmitRetainedFrame(void) { DDShim_SubmitLastPresented(g_ddLastPresented, 1); }
 
 void AeronDx5_EndFrame(void) {
+	/* VolkyTFColl v13: diagnostic heartbeat — which presentation path
+	 * runs (suppression / retained frame present / pending present).
+	 * VolkyTFColl v14: separate counter. v13 shared the submit log's
+	 * tick: EndFrame and the submit log each bumped it once per frame,
+	 * so EndFrame always saw an odd tick and tick % 600 == 0 (600 even)
+	 * could never fire — the heartbeat was dead code. */
+	static int s_ddshim_endframe_log_tick = 0;
+	if (++s_ddshim_endframe_log_tick >= 600) {
+		s_ddshim_endframe_log_tick = 0;
+		Aeron_LogInfo("tie.brightness", "Dx5 EndFrame suppressed=%d has_frame=%d pending=%d",
+			(int)g_ddClassicFlightRenderingSuppressed, (int)(g_ddLastPresented != NULL),
+			(int)g_ddSuppressedPresentPending);
+	}
 	if (g_ddClassicFlightRenderingSuppressed)
 		return;
 	/* TIE can enter a classic in-flight room inside the engine tick. The new
@@ -302,7 +607,7 @@ void AeronDx5_EndFrame(void) {
 			(void)DDShim_CommitRenderTargetPresent(g_ddLastPresented, 0, g_ddSuppressedPresentKind);
 		}
 	}
-	DDShim_SubmitLastPresented(g_ddLastPresented);
+	DDShim_SubmitLastPresented(g_ddLastPresented, 0);
 }
 
 uint64_t AeronDx5_GetClassicFlightFrameSerial(void) { return g_ddClassicFlightFrameSerial; }
@@ -313,11 +618,27 @@ void AeronDx5_ResetPresentationState(void) {
 	g_ddSuppressedPresentPending         = 0;
 	g_ddSuppressedPresentKind            = DDSHIM_PRESENT_BLT;
 	g_ddClassicFlightFrameSerial         = 0;
+	/* VolkyTFColl v16 (devam) Fix 2: sunum sifirlaninca son submit
+	 * kaydini da sil — sonraki kare atlanmasin. */
+	s_ddLastSubmittedGeneration = 0;
+	s_ddLastSubmittedRect       = (AeronRectI){ 0, 0, 0, 0 };
 }
 
 void DDShim_ReleasePresentationResources(void) {
 	AeronSurface_Destroy(g_ddRetainedCpuPresentation);
 	g_ddRetainedCpuPresentation = NULL;
+	/* VolkyTFColl v16: the brightened palette is static storage (no
+	 * allocation); reset the cache so a later presentation recomputes it. */
+	s_ddBrightenedPaletteValid      = 0;
+	s_ddBrightenedPaletteBrightness = 0.0f;
+	s_ddBrightenedPaletteSerial     = 0;
+	s_ddBrightSubmitGeneration      = 0;
+	s_ddBrightLastSurfaceGeneration = 0;
+	s_ddBrightLastPaletteSerial     = 0;
+	s_ddBrightLastBrightened        = -1;
+	/* VolkyTFColl v16 (devam) Fix 2: son submit kaydini da sil. */
+	s_ddLastSubmittedGeneration = 0;
+	s_ddLastSubmittedRect       = (AeronRectI){ 0, 0, 0, 0 };
 }
 
 /* Composite a source CPU surface onto a render surface's render target. The render
@@ -576,6 +897,7 @@ static int DDShim_EnsureRenderTargetStaging(DDrawSurfaceShim* s) {
 static int DDShim_ReadbackRenderTarget(DDrawSurfaceShim* s) {
 	int   pitch;
 	void* pixels;
+	uint64_t readback_t0;
 	if (!s || s->kind != DDSHIM_RENDER_TARGET)
 		return 1;
 	if (!DDShim_EnsureRenderTargetStaging(s))
@@ -587,11 +909,17 @@ static int DDShim_ReadbackRenderTarget(DDrawSurfaceShim* s) {
 	pixels = AeronSurface_Lock(s->cpu, &pitch);
 	if (!pixels)
 		return 0;
+	/* DIAG freeze: time the GPU readback (fence wait + download); a
+	 * slow readback here stalls the frame (Y-key 30s freeze suspect). */
+	readback_t0 = SDL_GetTicksNS();
 	if (!Aeron_ReadRenderTargetPixels(s->rt, pixels, pitch, s->format)) {
 		AeronSurface_Unlock(s->cpu);
 		Aeron_RequestFatalRendererError("DirectDraw render-target readback");
 		return 0;
 	}
+	if (SDL_GetTicksNS() - readback_t0 > 500000000ull)
+		Aeron_LogInfo("tie", "DIAG freeze readback_ms=%llu",
+			      (unsigned long long)((SDL_GetTicksNS() - readback_t0) / 1000000ull));
 	AeronSurface_Unlock(s->cpu);
 	s->gpu_dirty = 0;
 	s->cpu_dirty = 0;
