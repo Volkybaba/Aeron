@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <new>  // volkyxwall arm64 cross-build: std::nothrow used below; sibling temporal.cpp already includes <new>
 
 namespace {
 

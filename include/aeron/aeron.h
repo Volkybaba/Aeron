@@ -75,6 +75,10 @@ void Aeron_PumpEvents(void);
 /* Presents all render submissions queued for the current frame. Returns zero
  * after an unexpected renderer failure. A successful no-op frame returns one. */
 int Aeron_Present(void);
+/* Requests a GPU screenshot: the next presented frame is downloaded from the
+ * swapchain texture and saved as a BMP under the given file name in the user
+ * root. Returns nonzero when the request was accepted. */
+int Aeron_RequestScreenshot(const char* fileName);
 
 /* Requests that the application exit at the next convenient point. */
 void Aeron_RequestQuit(void);

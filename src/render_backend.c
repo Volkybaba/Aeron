@@ -28,6 +28,85 @@ static const AeronShaderFormatInfo g_shaderFormats[] = {
 #endif
 };
 
+/* Deferred GPU screenshot (v37): the game requests a capture and Aeron_Present
+ * downloads the composited swapchain texture on the next presented frame, before
+ * submit. The software framebuffer the old capture read is never written by the
+ * Vulkan renderer, so it produced black BMPs. Reading the swapchain texture
+ * through the GPU also bypasses the display layer entirely, so a compressed
+ * (AFBC) KMS plane cannot blank the capture the way kmsgrab/fbgrab can. */
+static int  g_screenshotPending;
+static char g_screenshotFileName[64];
+
+int Aeron_RequestScreenshot(const char* fileName) {
+	if (!fileName || !fileName[0]) {
+		return 0;
+	}
+	SDL_snprintf(g_screenshotFileName, sizeof(g_screenshotFileName), "%s", fileName);
+	g_screenshotPending = 1;
+	Aeron_LogInfo("aeron", "screenshot: requested %s", g_screenshotFileName);
+	return 1;
+}
+
+static void Aeron_WriteU16Le(uint8_t* p, uint16_t v) {
+	p[0] = (uint8_t)(v & 0xffu);
+	p[1] = (uint8_t)(v >> 8);
+}
+
+static void Aeron_WriteU32Le(uint8_t* p, uint32_t v) {
+	p[0] = (uint8_t)(v & 0xffu);
+	p[1] = (uint8_t)((v >> 8) & 0xffu);
+	p[2] = (uint8_t)((v >> 16) & 0xffu);
+	p[3] = (uint8_t)((v >> 24) & 0xffu);
+}
+
+/* Writes the downloaded RGBA frame as a 24-bit BMP (bottom-up BGR rows) to the
+ * user root under the requested file name. Returns the byte count on success, 0 on failure. */
+static int Aeron_SaveScreenshotBmp(const uint8_t* rgba, uint32_t width, uint32_t height, int ri, int gi,
+				   int bi) {
+	uint32_t row_bytes  = width * 3u;
+	uint32_t row_padded = (row_bytes + 3u) & ~3u;
+	uint64_t bmp_size   = 54u + (uint64_t)row_padded * (uint64_t)height;
+	uint8_t* bmp;
+	uint32_t y;
+	int      ok;
+
+	if (width == 0 || height == 0 || bmp_size > 64u * 1024u * 1024u) {
+		return 0;
+	}
+	bmp = (uint8_t*)SDL_malloc((size_t)bmp_size);
+	if (!bmp) {
+		return 0;
+	}
+	SDL_memset(bmp, 0, (size_t)bmp_size);
+	bmp[0] = 'B';
+	bmp[1] = 'M';
+	Aeron_WriteU32Le(bmp + 2, (uint32_t)bmp_size);
+	Aeron_WriteU32Le(bmp + 10, 54);
+	Aeron_WriteU32Le(bmp + 14, 40);
+	Aeron_WriteU32Le(bmp + 18, width);
+	Aeron_WriteU32Le(bmp + 22, height);
+	Aeron_WriteU16Le(bmp + 26, 1);
+	Aeron_WriteU16Le(bmp + 28, 24);
+	Aeron_WriteU32Le(bmp + 34, row_padded * height);
+	for (y = 0; y < height; ++y) {
+		const uint8_t* src = rgba + (size_t)(height - 1u - y) * (size_t)width * 4u;
+		uint8_t*       dst = bmp + 54u + (size_t)y * row_padded;
+		uint32_t       x;
+
+		for (x = 0; x < width; ++x) {
+			const uint8_t* p = src + (size_t)x * 4u;
+
+			dst[(size_t)x * 3u + 0] = p[bi];
+			dst[(size_t)x * 3u + 1] = p[gi];
+			dst[(size_t)x * 3u + 2] = p[ri];
+		}
+	}
+	ok = AeronVfs_WriteAllAtomic(&g_aeron.vfs, AERON_VFS_ROOT_USER, g_screenshotFileName, bmp,
+				     (size_t)bmp_size);
+	SDL_free(bmp);
+	return ok ? (int)bmp_size : 0;
+}
+
 static void Aeron_SetRenderError(const char* fmt, ...) {
 	va_list args;
 
@@ -1594,6 +1673,13 @@ int Aeron_Present(void) {
 	Uint32                 swapchain_height;
 	int                    i;
 	int                    present_ok;
+	SDL_GPUTransferBuffer* screenshot_transfer = NULL;
+	Uint32                 screenshot_width     = 0;
+	Uint32                 screenshot_height    = 0;
+	int                    screenshot_ri        = 0;
+	int                    screenshot_gi        = 1;
+	int                    screenshot_bi        = 2;
+	int                    screenshot_armed     = 0;
 
 	if (!g_aeron.initialized || !g_aeron.gpu_device) {
 		Aeron_SetRenderError("Aeron_Present called without an initialized GPU device");
@@ -1815,15 +1901,130 @@ int Aeron_Present(void) {
 	}
 	AeronGpuDebug_Pop(command_buffer);
 
+	/* Deferred screenshot: download the just-composited swapchain texture before
+	 * it is submitted for presentation. The copy runs on this command buffer, so
+	 * the fence acquired at submit below also guards the download. Any failure
+	 * here drops the screenshot silently; the frame still presents normally. */
+	if (g_screenshotPending && present_ok && swapchain_texture) {
+		SDL_GPUTextureFormat swapchain_format =
+			SDL_GetGPUSwapchainTextureFormat(g_aeron.gpu_device, g_aeron.window);
+		int      ri        = 0;
+		int      gi        = 1;
+		int      bi        = 2;
+		int      format_ok = 1;
+		uint64_t transfer_size;
+
+		switch (swapchain_format) {
+		case SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM:
+		case SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB:
+			ri = 0;
+			gi = 1;
+			bi = 2;
+			break;
+		case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM:
+		case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB:
+			ri = 2;
+			gi = 1;
+			bi = 0;
+			break;
+		default:
+			format_ok = 0;
+			break;
+		}
+		g_screenshotPending = 0;
+		if (!format_ok) {
+			Aeron_LogInfo("aeron", "screenshot: unsupported swapchain format %d, dropped",
+				      (int)swapchain_format);
+		}
+		transfer_size       = (uint64_t)swapchain_width * (uint64_t)swapchain_height * 4u;
+		if (format_ok && transfer_size > 0 && transfer_size <= UINT32_MAX) {
+			SDL_GPUTransferBufferCreateInfo transfer_info;
+
+			SDL_zero(transfer_info);
+			transfer_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+			transfer_info.size  = (uint32_t)transfer_size;
+			screenshot_transfer = SDL_CreateGPUTransferBuffer(g_aeron.gpu_device, &transfer_info);
+		}
+		if (format_ok && !screenshot_transfer) {
+			Aeron_LogInfo("aeron", "screenshot: transfer buffer failed, dropped");
+		}
+		if (screenshot_transfer) {
+			SDL_GPUTextureRegion       source;
+			SDL_GPUTextureTransferInfo destination;
+			SDL_GPUCopyPass*           copy_pass;
+
+			SDL_zero(source);
+			source.texture = swapchain_texture;
+			source.w       = swapchain_width;
+			source.h       = swapchain_height;
+			source.d       = 1;
+			SDL_zero(destination);
+			destination.transfer_buffer = screenshot_transfer;
+			destination.pixels_per_row  = swapchain_width;
+			destination.rows_per_layer  = swapchain_height;
+			copy_pass = SDL_BeginGPUCopyPass(command_buffer);
+			if (copy_pass) {
+				SDL_DownloadFromGPUTexture(copy_pass, &source, &destination);
+				SDL_EndGPUCopyPass(copy_pass);
+				screenshot_width  = swapchain_width;
+				screenshot_height = swapchain_height;
+				screenshot_ri     = ri;
+				screenshot_gi     = gi;
+				screenshot_bi     = bi;
+				screenshot_armed  = 1;
+				Aeron_LogInfo("aeron", "screenshot: downloading %ux%u format %d",
+					      screenshot_width, screenshot_height, (int)swapchain_format);
+			} else {
+				Aeron_LogInfo("aeron", "screenshot: copy pass failed, dropped");
+				SDL_ReleaseGPUTransferBuffer(g_aeron.gpu_device, screenshot_transfer);
+				screenshot_transfer = NULL;
+			}
+		}
+	}
+
 	if (!present_ok) {
 		SDL_CancelGPUCommandBuffer(command_buffer);
 		return 0;
 	}
 	SDL_ClearError();
-	if (!SDL_SubmitGPUCommandBuffer(command_buffer)) {
+	if (screenshot_armed) {
+		SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(command_buffer);
+
+		if (!fence) {
+			const char* error = SDL_GetError();
+
+			Aeron_SetRenderError(
+				"SDL_SubmitGPUCommandBufferAndAcquireFence failed for screenshot presentation: %s",
+				error && error[0] ? error : "<no SDL error provided>");
+			SDL_ReleaseGPUTransferBuffer(g_aeron.gpu_device, screenshot_transfer);
+			return 0;
+		}
+		SDL_WaitForGPUFences(g_aeron.gpu_device, true, &fence, 1);
+		SDL_ReleaseGPUFence(g_aeron.gpu_device, fence);
+		{
+			const uint8_t* mapped =
+				(const uint8_t*)SDL_MapGPUTransferBuffer(g_aeron.gpu_device, screenshot_transfer, false);
+
+			if (mapped) {
+				int saved = Aeron_SaveScreenshotBmp(mapped, screenshot_width, screenshot_height,
+								    screenshot_ri, screenshot_gi, screenshot_bi);
+				SDL_UnmapGPUTransferBuffer(g_aeron.gpu_device, screenshot_transfer);
+				if (saved > 0) {
+					Aeron_LogInfo("aeron", "screenshot: saved %s (%d bytes)",
+						      g_screenshotFileName, saved);
+				} else {
+					Aeron_LogInfo("aeron", "screenshot: write failed %s", g_screenshotFileName);
+				}
+			} else {
+				Aeron_LogInfo("aeron", "screenshot: transfer map failed, dropped");
+			}
+		}
+		SDL_ReleaseGPUTransferBuffer(g_aeron.gpu_device, screenshot_transfer);
+	} else if (!SDL_SubmitGPUCommandBuffer(command_buffer)) {
 		const char* error = SDL_GetError();
+
 		Aeron_SetRenderError("SDL_SubmitGPUCommandBuffer failed for presentation: %s",
-							 error && error[0] ? error : "<no SDL error provided>");
+				       error && error[0] ? error : "<no SDL error provided>");
 		return 0;
 	}
 	return 1;
