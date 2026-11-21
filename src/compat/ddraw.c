@@ -3,6 +3,7 @@
 
 #include "aeron/aeron.h"
 #include "aeron/render.h"
+#include "aeron/scene/present.h"
 #include "aeron/surface.h"
 
 #include <stdlib.h>
@@ -248,6 +249,129 @@ static void DDShim_Present(DDrawSurfaceShim* frame, DDShimPresentKind kind) {
 	g_ddLastPresented = frame;
 }
 
+/* VolkyXWCD v7: CPU-side brightness for the retained classic surface.
+ * The compositor's fragment-uniform tint is ignored on this device
+ * (proven in VolkyTFColl v11/v12: tint submitted every frame, screen
+ * unchanged), so the brightness is baked into the pixels before
+ * submission. The palette has only 256 entries — each is brightened
+ * ONCE into a lookup table per call (AeronScenePresent_BrightenSrgb8,
+ * half-gamma), then the per-pixel loop does plain table lookups and
+ * never runs powf per pixel (per-pixel powf starved the film task's
+ * audio decode in VolkyTFColl v16). A cheap FNV-1a checksum over the
+ * INDEX8 source + palette + brightness detects unchanged frames, which
+ * reuse the last brightened output without re-running the pixel loop
+ * and without bumping generation, so the upload cache reuses the
+ * uploaded texture. b == 1.0 takes the old path with no copy. */
+static uint8_t* s_ddBrightenedScratch       = NULL;
+static size_t   s_ddBrightenedScratchBytes  = 0;
+static uint32_t s_ddBrightenedScratchSerial = 0;
+static uint32_t s_ddBrightenLastChecksum    = 0;
+static float    s_ddBrightenLastBrightness  = 0.0f;
+static int      s_ddBrightenHaveLast        = 0;
+static AeronPixelFrameView s_ddBrightenLastOut;
+
+static uint32_t DDShim_BrightenChecksum(const AeronPixelFrameView* view, float brightness) {
+	uint32_t hash = 2166136261u;
+	int      y;
+	for (y = 0; y < view->height; ++y) {
+		const uint8_t* row = (const uint8_t*)view->pixels + (size_t)y * (size_t)view->pitch;
+		int            x;
+		for (x = 0; x < view->width; ++x) {
+			hash ^= row[x];
+			hash *= 16777619u;
+		}
+	}
+	{
+		const uint8_t* pal = (const uint8_t*)view->palette;
+		size_t         i;
+		for (i = 0; i < 256u * sizeof(AeronPaletteEntry); ++i) {
+			hash ^= pal[i];
+			hash *= 16777619u;
+		}
+	}
+	{
+		uint32_t bits;
+		memcpy(&bits, &brightness, sizeof(bits));
+		hash ^= bits;
+		hash *= 16777619u;
+		hash ^= (uint32_t)view->width;
+		hash *= 16777619u;
+		hash ^= (uint32_t)view->height;
+		hash *= 16777619u;
+	}
+	return hash;
+}
+
+/* Expand an INDEX8+palette view into the scratch RGBA8888 buffer with the
+ * brightness applied per channel. Returns 1 and fills *out on success; 0
+ * leaves *out untouched (caller keeps the old path). The scratch is reused
+ * across frames; generation bumps every submit so the upload cache never
+ * holds a stale frame (it keys on generation + pixels address). */
+static int DDShim_BrightenRetainedView(const AeronPixelFrameView* view, float brightness,
+				       AeronPixelFrameView* out) {
+	size_t bytes;
+	int    y;
+
+	if (!view || !view->pixels || !view->palette || view->width <= 0 || view->height <= 0)
+		return 0;
+	bytes = (size_t)view->width * (size_t)view->height * 4u;
+	if (!s_ddBrightenedScratch || s_ddBrightenedScratchBytes < bytes) {
+		uint8_t* replacement = (uint8_t*)realloc(s_ddBrightenedScratch, bytes);
+		if (!replacement)
+			return 0;
+		s_ddBrightenedScratch      = replacement;
+		s_ddBrightenedScratchBytes = bytes;
+	}
+	/* Unchanged frame -> reuse the last brightened output without
+	 * re-running the pixel loop and without bumping generation. */
+	{
+		uint32_t checksum = DDShim_BrightenChecksum(view, brightness);
+		if (s_ddBrightenHaveLast && checksum == s_ddBrightenLastChecksum &&
+		    brightness == s_ddBrightenLastBrightness && s_ddBrightenedScratch) {
+			*out        = s_ddBrightenLastOut;
+			out->pixels = s_ddBrightenedScratch;
+			return 1;
+		}
+		s_ddBrightenLastChecksum   = checksum;
+		s_ddBrightenLastBrightness = brightness;
+	}
+	{
+		uint8_t bright_r[256];
+		uint8_t bright_g[256];
+		uint8_t bright_b[256];
+		int     i;
+		for (i = 0; i < 256; ++i) {
+			const AeronPaletteEntry* entry = &view->palette[i];
+			bright_r[i] = AeronScenePresent_BrightenSrgb8(entry->r);
+			bright_g[i] = AeronScenePresent_BrightenSrgb8(entry->g);
+			bright_b[i] = AeronScenePresent_BrightenSrgb8(entry->b);
+		}
+		for (y = 0; y < view->height; ++y) {
+			const uint8_t* src_row = (const uint8_t*)view->pixels + (size_t)y * (size_t)view->pitch;
+			uint8_t*       dst_row = s_ddBrightenedScratch + (size_t)y * (size_t)view->width * 4u;
+			int            x;
+			for (x = 0; x < view->width; ++x) {
+				const uint8_t idx    = src_row[x];
+				uint8_t*      out_px = dst_row + (size_t)x * 4u;
+				out_px[0] = bright_r[idx];
+				out_px[1] = bright_g[idx];
+				out_px[2] = bright_b[idx];
+				out_px[3] = view->palette[idx].a;
+			}
+		}
+	}
+	*out            = *view;
+	out->pixels     = s_ddBrightenedScratch;
+	out->pitch      = view->width * 4;
+	out->bpp        = 32;
+	out->format     = AERON_PIXEL_FORMAT_RGBA8888;
+	out->palette    = NULL;
+	out->generation = ++s_ddBrightenedScratchSerial;
+	s_ddBrightenLastOut  = *out;
+	s_ddBrightenHaveLast = 1;
+	return 1;
+}
+
 static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame) {
 	if (!frame) {
 		return;
@@ -263,6 +387,20 @@ static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame) {
 		tex.logical_rect = DDShim_ClassicPresentationRect(frame);
 		tex.blend_mode   = AERON_LAYER_BLEND_OPAQUE;
 		tex.color_space  = AERON_COLOR_SPACE_SRGB;
+		/* VolkyXWCD v7: user brightness. The render-target texture
+		 * cannot be CPU-brightened, so the tint is the only option
+		 * here (kept for completeness; the retained CPU path below
+		 * is the one that visibly brightens on this device). */
+		{
+			const float brightness = AeronScenePresent_Brightness();
+			if (brightness != 1.0f) {
+				tex.tint_enabled = 1;
+				tex.tint_rgba[0] = brightness;
+				tex.tint_rgba[1] = brightness;
+				tex.tint_rgba[2] = brightness;
+				tex.tint_rgba[3] = 1.0f;
+			}
+		}
 		if (tex.texture) {
 			if (!Aeron_SubmitTextureLayer(&tex)) {
 				Aeron_RequestFatalRendererError("retained classic texture presentation");
@@ -273,6 +411,8 @@ static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame) {
 	if (g_ddRetainedCpuPresentation) {
 		AeronPixelFrameView view;
 		AeronPixelLayerDesc layer;
+		const float         brightness = AeronScenePresent_Brightness();
+		int                 cpu_brightened = 0;
 		if (!AeronSurface_GetFrameView(g_ddRetainedCpuPresentation, &view)) {
 			return;
 		}
@@ -281,6 +421,26 @@ static void DDShim_SubmitLastPresented(DDrawSurfaceShim* frame) {
 		layer.logical_rect = DDShim_ClassicPresentationRect(frame);
 		layer.blend_mode   = AERON_LAYER_BLEND_OPAQUE;
 		layer.sampling     = AERON_PIXEL_SAMPLING_SHARP_BILINEAR;
+		/* VolkyXWCD v7: CPU-side brightness
+		 * (DDShim_BrightenRetainedView). The GPU tint is kept only as
+		 * a fallback for non-INDEX8 retained frames (or a scratch
+		 * allocation failure); for INDEX8+palette frames the
+		 * brightness is baked into the scratch pixels and tint stays
+		 * off — single application, no double multiply. */
+		if (brightness != 1.0f && view.format == AERON_PIXEL_FORMAT_INDEX8 && view.palette) {
+			AeronPixelFrameView bright;
+			if (DDShim_BrightenRetainedView(&view, brightness, &bright)) {
+				layer.frame    = bright;
+				cpu_brightened = 1;
+			}
+		}
+		if (!cpu_brightened && brightness != 1.0f) {
+			layer.tint_enabled = 1;
+			layer.tint_rgba[0] = brightness;
+			layer.tint_rgba[1] = brightness;
+			layer.tint_rgba[2] = brightness;
+			layer.tint_rgba[3] = 1.0f;
+		}
 		if (!Aeron_SubmitPixelLayer(&layer)) {
 			Aeron_RequestFatalRendererError("retained classic software-surface presentation");
 		}
@@ -316,6 +476,11 @@ void AeronDx5_ResetPresentationState(void) {
 void DDShim_ReleasePresentationResources(void) {
 	AeronSurface_Destroy(g_ddRetainedCpuPresentation);
 	g_ddRetainedCpuPresentation = NULL;
+	/* VolkyXWCD v7: free the CPU-brightness scratch. */
+	free(s_ddBrightenedScratch);
+	s_ddBrightenedScratch      = NULL;
+	s_ddBrightenedScratchBytes = 0;
+	s_ddBrightenHaveLast      = 0;
 }
 
 /* Composite a source CPU surface onto a render surface's render target. The render

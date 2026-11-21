@@ -54,6 +54,18 @@ void  AeronScenePresent_SetEotfExponent(float v);
 float AeronScenePresent_AcesExposure(void);
 void  AeronScenePresent_SetAcesExposure(float v);
 
+/* VolkyXWCD v7: user brightness, clamped to [0.5, 3.0]; default 1.0.
+ * Applied as the scene exposure (u[4]) in the present chain: the tonemap
+ * shader multiplies (scene + bloom) by it in linear space BEFORE the
+ * operator, so it brightens/darkens without re-encoding. The classic
+ * pixel paths read the same value live for their CPU brighten.
+ * AeronScenePresent_BrightenSrgb8 applies the current brightness to one
+ * sRGB byte with the half-gamma curve (identity at 1.0); palette-based
+ * paths call it once per palette entry instead of per pixel. */
+float   AeronScenePresent_Brightness(void);
+void    AeronScenePresent_SetBrightness(float v);
+uint8_t AeronScenePresent_BrightenSrgb8(uint8_t srgb);
+
 /* Apply a complete validated renderer configuration. Individual setters
  * remain available for interactive debug tools. */
 void AeronScenePresent_ApplySettings(const AeronSceneTonemapSettings* settings);

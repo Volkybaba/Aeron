@@ -9,6 +9,7 @@
 #include "aeron/log.h"
 #include "internal.h"
 
+#include <math.h>
 #include <stdlib.h>
 
 static const char* tonemap_op_name(int op) {
@@ -118,6 +119,61 @@ void AeronScenePresent_SetAcesExposure(float v) {
 		v = 3.0f;
 	}
 	s_aces_exposure = v;
+}
+
+/* VolkyXWCD v7: user brightness (scene exposure, present u[4]). */
+static float s_brightness = 1.0f;
+
+float AeronScenePresent_Brightness(void) { return s_brightness; }
+
+void AeronScenePresent_SetBrightness(float v) {
+	if (!(v > 0.0f)) {
+		v = 1.0f;
+	}
+	if (v < 0.5f) {
+		v = 0.5f;
+	}
+	if (v > 3.0f) {
+		v = 3.0f;
+	}
+	s_brightness = v;
+}
+
+/* VolkyXWCD v7: half-gamma lift for one sRGB byte. The full gamma curve
+ * (powf(linear, 1/b)) lifts deep shadows strongly but washes out bright
+ * scenes at high brightness; the half-gamma exponent sits halfway between
+ * linear (1.0) and the full gamma (1/b), so 300% behaves like 150% full
+ * gamma. At 1.0 the exponent is 1.0 (identity). Palette-based paths call
+ * this once per palette entry; the per-pixel loop then does plain table
+ * lookups and never runs powf per pixel (per-pixel powf starved the film
+ * task's audio decode in VolkyTFColl v16). */
+static float Present_Srgb8ToLinear(uint8_t value) {
+	float srgb = (float)value / 255.0f;
+	return srgb <= 0.04045f ? srgb / 12.92f : powf((srgb + 0.055f) / 1.055f, 2.4f);
+}
+
+static uint8_t Present_LinearToSrgb8(float value) {
+	float srgb;
+	if (!(value > 0.0f))
+		return 0;
+	if (value > 1.0f)
+		value = 1.0f;
+	srgb = value <= 0.0031308f ? 12.92f * value : 1.055f * powf(value, 1.0f / 2.4f) - 0.055f;
+	if (srgb < 0.0f)
+		srgb = 0.0f;
+	if (srgb > 1.0f)
+		srgb = 1.0f;
+	return (uint8_t)(srgb * 255.0f + 0.5f);
+}
+
+uint8_t AeronScenePresent_BrightenSrgb8(uint8_t srgb) {
+	float linear;
+	if (s_brightness == 1.0f)
+		return srgb;
+	linear = Present_Srgb8ToLinear(srgb);
+	if (!(linear > 0.0f))
+		return 0;
+	return Present_LinearToSrgb8(powf(linear, (1.0f + 1.0f / s_brightness) * 0.5f));
 }
 
 void AeronScenePresent_ApplySettings(const AeronSceneTonemapSettings* settings) {
@@ -239,7 +295,7 @@ void AeronScenePresentChain_Draw(AeronScenePresentChain* c, AeronRenderPass* pas
 		rt_w > 0 ? 2.0f / (float)rt_w : 0.0f,
 		rt_h > 0 ? 2.0f / (float)rt_h : 0.0f,
 		bar_y_uv,
-		1.0f, /* scene exposure */
+		AeronScenePresent_Brightness(), /* scene exposure (v7 user brightness) */
 		(float)AeronScenePresent_TonemapOp(),
 		hdr_peak_scale,
 		Aeron_RenderPassOutputRgbScale(pass),
